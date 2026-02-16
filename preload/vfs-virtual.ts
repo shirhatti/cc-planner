@@ -22,14 +22,8 @@ import type {
   WriteFileOptions,
 } from "node:fs";
 
-type ReadFileOptions =
-  | BufferEncoding
-  | (ObjectEncodingOptions & { flag?: string })
-  | null;
-type ReadFileCallback = (
-  err: NodeJS.ErrnoException | null,
-  data?: string | Buffer,
-) => void;
+type ReadFileOptions = BufferEncoding | (ObjectEncodingOptions & { flag?: string }) | null;
+type ReadFileCallback = (err: NodeJS.ErrnoException | null, data?: string | Buffer) => void;
 
 const PLANS_DIR = path.join(process.env.HOME, ".claude", "plans");
 
@@ -67,9 +61,16 @@ const orig = {
 };
 
 // Intercept fs.writeFileSync - store in memory instead of disk
-fs.writeFileSync = function (filePath: PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, options?: WriteFileOptions) {
+fs.writeFileSync = function (
+  filePath: PathOrFileDescriptor,
+  data: string | NodeJS.ArrayBufferView,
+  options?: WriteFileOptions,
+) {
   if (isVirtualPath(filePath)) {
-    const content = typeof data === "string" ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf-8");
+    const content =
+      typeof data === "string"
+        ? data
+        : Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf-8");
     const normalized = path.resolve(filePath);
 
     // Store in virtual filesystem
@@ -96,12 +97,20 @@ fs.writeFileSync = function (filePath: PathOrFileDescriptor, data: string | Node
 };
 
 // Intercept fs.writeFile (async)
-fs.writeFile = function (filePath: PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, options: WriteFileOptions | NoParamCallback, callback?: NoParamCallback) {
+fs.writeFile = function (
+  filePath: PathOrFileDescriptor,
+  data: string | NodeJS.ArrayBufferView,
+  options: WriteFileOptions | NoParamCallback,
+  callback?: NoParamCallback,
+) {
   const cb = typeof options === "function" ? options : callback;
   const opts = typeof options === "function" ? undefined : options;
 
   if (isVirtualPath(filePath)) {
-    const content = typeof data === "string" ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf-8");
+    const content =
+      typeof data === "string"
+        ? data
+        : Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf-8");
     const normalized = path.resolve(filePath);
 
     virtualFiles.set(normalized, content);
@@ -162,7 +171,11 @@ fs.readFileSync = function (filePath: PathOrFileDescriptor, options?: ReadFileOp
 };
 
 // Intercept fs.readFile (async)
-fs.readFile = function (filePath: PathOrFileDescriptor, options: ReadFileOptions | ReadFileCallback, callback?: ReadFileCallback) {
+fs.readFile = function (
+  filePath: PathOrFileDescriptor,
+  options: ReadFileOptions | ReadFileCallback,
+  callback?: ReadFileCallback,
+) {
   const cb = typeof options === "function" ? options : callback;
   const opts: ReadFileOptions | undefined = typeof options === "function" ? undefined : options;
 
