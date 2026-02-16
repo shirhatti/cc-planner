@@ -7,6 +7,7 @@ A complete in-memory Virtual File System (VFS) for Claude Code's Plan Mode. Plan
 When Claude Code operates in Plan Mode, it writes plan files to `~/.claude/plans/`. This VFS intercepts all filesystem operations for that directory and virtualizes them completely in memory.
 
 **Key Features:**
+
 - 📁 **Complete Virtualization** - Plan files never touch disk
 - 🚀 **Real-time Streaming** - Stream plan content via IPC as it's written
 - 🔍 **Full Transparency** - All other filesystem paths work normally
@@ -20,6 +21,7 @@ Claude Code uses an atomic write pattern when creating plan files:
 2. Rename to final: `~/.claude/plans/plan.md`
 
 The VFS intercepts both operations:
+
 - **writeFileSync** - captures content and stores in memory
 - **renameSync** - updates the virtual filename and broadcasts via IPC
 - **readFileSync** - returns content from memory
@@ -50,6 +52,7 @@ bun test
 ```
 
 This runs two tests:
+
 1. **Virtual VFS Test** - Verifies plan files never touch disk
 2. **Passthrough Test** - Verifies regular files work normally
 
@@ -120,12 +123,41 @@ for await (const msg of session) {
 }
 ```
 
+## Running Inside a Claude Code Sandbox
+
+When you use the SDK inside a Claude Code remote session (e.g., `claude.ai/code`), the child `claude` process inherits environment variables that reference **parent-only file descriptors** — pipes that can't be inherited. The child crashes immediately trying to read from a non-existent FD.
+
+**Why it happens:** The parent authenticates via an OAuth token passed through file descriptor 4 (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=4`). That FD belongs to the parent and isn't available to children.
+
+**The fix:** The same underlying token is written to disk at `~/.claude/remote/.session_ingress_token` as a session ingress token (`sk-ant-si-...`). The `claude` CLI accepts it via `ANTHROPIC_AUTH_TOKEN`, bypassing FD-based auth entirely.
+
+Before spawning a child claude process, you need to:
+
+1. Set `ANTHROPIC_AUTH_TOKEN` to the contents of `~/.claude/remote/.session_ingress_token`
+2. Delete env vars that reference parent-only file descriptors:
+   - `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`
+   - `CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR`
+3. Delete env vars that conflict with the parent session:
+   - `CLAUDE_CODE_SESSION_ID`
+   - `CLAUDE_CODE_REMOTE_SESSION_ID`
+   - `CLAUDE_CODE_CONTAINER_ID`
+   - `CLAUDECODE`
+   - `CLAUDE_CODE_REMOTE`
+
+The example at `scripts/sdk-example.ts` demonstrates this with a `buildChildEnv()` helper that conditionally applies these fixups only when running inside a sandbox, so the same code works on both a regular desktop and inside `claude.ai/code`:
+
+```bash
+bun run scripts/sdk-example.ts
+```
+
 ## IPC Events
 
 The VFS communicates via IPC messages:
 
 ### `vfs_init`
+
 Sent when VFS initializes.
+
 ```typescript
 {
   type: "vfs_init",
@@ -136,7 +168,9 @@ Sent when VFS initializes.
 ```
 
 ### `vfs_write`
+
 Sent when content is written (including temp files).
+
 ```typescript
 {
   type: "vfs_write",
@@ -149,7 +183,9 @@ Sent when content is written (including temp files).
 ```
 
 ### `plan_file_write`
+
 Sent when a plan file is finalized (after rename).
+
 ```typescript
 {
   type: "plan_file_write",
@@ -162,7 +198,9 @@ Sent when a plan file is finalized (after rename).
 ```
 
 ### `vfs_read`
+
 Sent when a virtual file is read.
+
 ```typescript
 {
   type: "vfs_read",
@@ -174,7 +212,9 @@ Sent when a virtual file is read.
 ```
 
 ### `vfs_unlink`
+
 Sent when a virtual file is deleted.
+
 ```typescript
 {
   type: "vfs_unlink",
@@ -194,6 +234,7 @@ cc-planner/
 ├── preload/
 │   └── vfs-virtual.ts          # Virtual filesystem implementation
 └── scripts/
+    ├── sdk-example.ts          # Runnable SDK example (sandbox-safe)
     └── vfs-virtual.test.ts     # Bun test suite
 ```
 
@@ -286,6 +327,7 @@ The tests verify:
 2. **Passthrough** - Regular files outside `~/.claude/plans/` work normally and are written to disk
 
 Expected output:
+
 ```
 bun test v1.3.3
  2 pass
@@ -297,20 +339,24 @@ Ran 2 tests across 1 file. [339.00ms]
 ## Use Cases
 
 ### Real-time Plan Streaming
+
 Stream plan content to a web UI as Claude writes it:
 
 ```typescript
 proc.on("message", (msg) => {
   if (msg.type === "plan_file_write") {
-    webSocket.send(JSON.stringify({
-      type: "plan_update",
-      content: msg.content,
-    }));
+    webSocket.send(
+      JSON.stringify({
+        type: "plan_update",
+        content: msg.content,
+      }),
+    );
   }
 });
 ```
 
 ### Plan Analytics
+
 Track plan evolution over time without disk I/O:
 
 ```typescript
@@ -324,6 +370,7 @@ proc.on("message", (msg) => {
 ```
 
 ### Multi-session Plans
+
 Keep multiple planning sessions isolated in memory:
 
 ```typescript
