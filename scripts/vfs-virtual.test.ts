@@ -1,4 +1,4 @@
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect } from "bun:test";
 import { spawn } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -14,12 +14,12 @@ test("virtual VFS - plan files never touch disk", async () => {
   const filesBefore = new Set<string>();
   try {
     const existing = await Bun.readdir(PLANS_DIR);
-    existing.forEach(f => filesBefore.add(f));
+    existing.forEach((f) => filesBefore.add(f));
   } catch {
     // Plans directory doesn't exist yet
   }
 
-  const events: any[] = [];
+  const events: Record<string, unknown>[] = [];
 
   // Create a simple test script
   const testScript = `
@@ -54,7 +54,7 @@ console.log("All operations complete!");
     stdio: ["inherit", "pipe", "pipe", "ipc"],
   });
 
-  proc.on("message", (msg: any) => {
+  proc.on("message", (msg: Record<string, unknown>) => {
     events.push(msg);
   });
 
@@ -66,17 +66,17 @@ console.log("All operations complete!");
   expect(exitCode).toBe(0);
 
   // Wait a bit for filesystem to settle
-  await new Promise(resolve => setTimeout(resolve, 100));
+  await new Promise((resolve) => setTimeout(resolve, 100));
 
   // Check if any new files were created on disk
-  let filesAfter: string[] = [];
+  let filesAfter: string[];
   try {
     filesAfter = await Bun.readdir(PLANS_DIR);
   } catch {
     filesAfter = [];
   }
 
-  const newFiles = filesAfter.filter(f => !filesBefore.has(f));
+  const newFiles = filesAfter.filter((f) => !filesBefore.has(f));
 
   // Assert: No files should have been written to disk
   expect(newFiles.length).toBe(0);
@@ -84,8 +84,8 @@ console.log("All operations complete!");
   // Assert: We should have received VFS events
   expect(events.length).toBeGreaterThan(0);
 
-  const vfsInit = events.find(e => e.type === "vfs_init");
-  const planWrite = events.find(e => e.type === "plan_file_write");
+  const vfsInit = events.find((e) => e.type === "vfs_init");
+  const planWrite = events.find((e) => e.type === "plan_file_write");
 
   expect(vfsInit).toBeDefined();
   expect(vfsInit?.mode).toBe("virtual");
@@ -103,7 +103,7 @@ test("virtual VFS - regular files pass through to disk", async () => {
     await Bun.write(TEST_FILE, ""); // Clear it
   }
 
-  const events: any[] = [];
+  const events: Record<string, unknown>[] = [];
 
   const testScript = `
 const fs = require('fs');
@@ -129,7 +129,7 @@ console.log("All operations complete!");
     stdio: ["inherit", "pipe", "pipe", "ipc"],
   });
 
-  proc.on("message", (msg: any) => {
+  proc.on("message", (msg: Record<string, unknown>) => {
     events.push(msg);
   });
 
@@ -140,16 +140,14 @@ console.log("All operations complete!");
   expect(exitCode).toBe(0);
 
   // Wait a bit for filesystem
-  await new Promise(resolve => setTimeout(resolve, 100));
+  await new Promise((resolve) => setTimeout(resolve, 100));
 
   // Assert: Regular file should exist on disk
   const fileExists = existsSync(TEST_FILE);
   expect(fileExists).toBe(true);
 
   // Assert: VFS should not have intercepted regular file operations
-  const vfsEvents = events.filter(e =>
-    e.type === "vfs_write" || e.type === "vfs_read"
-  );
+  const vfsEvents = events.filter((e) => e.type === "vfs_write" || e.type === "vfs_read");
   expect(vfsEvents.length).toBe(0);
 
   // Clean up
