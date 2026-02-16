@@ -204,10 +204,22 @@ fs.renameSync = function (oldPath: any, newPath: any) {
       virtualFiles.delete(oldNormalized);
     } else {
       // Reading from disk, moving to virtual
+      content = orig.readFileSync.call(fs, oldPath, "utf-8");
       try {
-        content = orig.readFileSync.call(fs, oldPath, "utf-8");
         orig.unlinkSync.call(fs, oldPath);
-      } catch {}
+      } catch (unlinkErr: any) {
+        // Source cleanup failed after successful read — log but continue
+        // since we already have the content for the virtual filesystem.
+        if (process.send) {
+          process.send({
+            type: "vfs_error",
+            operation: "renameSync_unlink",
+            path: oldNormalized,
+            error: unlinkErr?.message || String(unlinkErr),
+            timestamp: Date.now(),
+          });
+        }
+      }
     }
 
     if (content && newVirtual) {
