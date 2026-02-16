@@ -157,16 +157,6 @@ fs.readFile = function (filePath: any, options: any, callback?: any) {
     const normalized = path.resolve(filePath);
     const content = virtualFiles.get(normalized);
 
-    if (process.send) {
-      process.send({
-        type: "vfs_read",
-        path: normalized,
-        filename: path.basename(normalized),
-        size: content?.length || 0,
-        timestamp: Date.now(),
-      });
-    }
-
     if (content === undefined) {
       const err: any = new Error(`ENOENT: no such file or directory, open '${filePath}'`);
       err.code = "ENOENT";
@@ -174,6 +164,17 @@ fs.readFile = function (filePath: any, options: any, callback?: any) {
         process.nextTick(callback, err);
       }
       return;
+    }
+
+    // Broadcast read event only for files that exist
+    if (process.send) {
+      process.send({
+        type: "vfs_read",
+        path: normalized,
+        filename: path.basename(normalized),
+        size: content.length,
+        timestamp: Date.now(),
+      });
     }
 
     const encoding = typeof options === "string" ? options : options?.encoding;
