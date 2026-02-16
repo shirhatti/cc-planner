@@ -1,0 +1,19 @@
+{
+  "name": "@shirhatti/cc-planner",
+  "version": "1.0.0",
+  "description": "Virtual File System for Claude Code Plan Mode",
+  "author": "shirhatti",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "bun test scripts/vfs-virtual.test.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "latest"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.9",
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.2"
+  }
+}
