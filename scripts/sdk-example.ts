@@ -97,7 +97,8 @@ const childEnv = buildChildEnv();
 console.log(`[sdk-example] sandbox=${isRemoteSandbox}, starting query...`);
 
 const session = query({
-  prompt: "What is 2 + 2? Reply with just the number.",
+  prompt:
+    "Create a plan for adding a new IPC message type called 'vfs_stats' that returns the count and total size of all virtual files. Do not ask clarifying questions — just write the plan.",
   options: {
     env: childEnv,
     permissionMode: "plan",
