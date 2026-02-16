@@ -13,13 +13,31 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+import type {
+  PathLike,
+  PathOrFileDescriptor,
+  NoParamCallback,
+  ObjectEncodingOptions,
+  StatSyncOptions,
+  WriteFileOptions,
+} from "node:fs";
+
+type ReadFileOptions =
+  | BufferEncoding
+  | (ObjectEncodingOptions & { flag?: string })
+  | null;
+type ReadFileCallback = (
+  err: NodeJS.ErrnoException | null,
+  data?: string | Buffer,
+) => void;
+
 const PLANS_DIR = path.join(process.env.HOME, ".claude", "plans");
 
 // In-memory virtual filesystem for plan files
 const virtualFiles = new Map<string, string>();
 
 // Helper to check if path is in plans directory
-function isVirtualPath(filePath: string): boolean {
+function isVirtualPath(filePath: PathOrFileDescriptor): boolean {
   if (!filePath || typeof filePath !== "string") return false;
   const normalized = path.resolve(filePath);
   return normalized.startsWith(PLANS_DIR);
@@ -49,9 +67,9 @@ const orig = {
 };
 
 // Intercept fs.writeFileSync - store in memory instead of disk
-fs.writeFileSync = function (filePath: any, data: any, options?: any) {
+fs.writeFileSync = function (filePath: PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, options?: WriteFileOptions) {
   if (isVirtualPath(filePath)) {
-    const content = typeof data === "string" ? data : data?.toString("utf-8") || "";
+    const content = typeof data === "string" ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf-8");
     const normalized = path.resolve(filePath);
 
     // Store in virtual filesystem
@@ -78,14 +96,12 @@ fs.writeFileSync = function (filePath: any, data: any, options?: any) {
 };
 
 // Intercept fs.writeFile (async)
-fs.writeFile = function (filePath: any, data: any, options: any, callback?: any) {
-  if (typeof options === "function") {
-    callback = options;
-    options = undefined;
-  }
+fs.writeFile = function (filePath: PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, options: WriteFileOptions | NoParamCallback, callback?: NoParamCallback) {
+  const cb = typeof options === "function" ? options : callback;
+  const opts = typeof options === "function" ? undefined : options;
 
   if (isVirtualPath(filePath)) {
-    const content = typeof data === "string" ? data : data?.toString("utf-8") || "";
+    const content = typeof data === "string" ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf-8");
     const normalized = path.resolve(filePath);
 
     virtualFiles.set(normalized, content);
@@ -102,28 +118,27 @@ fs.writeFile = function (filePath: any, data: any, options: any, callback?: any)
     }
 
     // Simulate async completion
-    if (callback) {
-      process.nextTick(callback, null);
+    if (cb) {
+      process.nextTick(cb, null);
     }
     return;
   }
 
-  return orig.writeFile.call(this, filePath, data, options, callback);
+  return orig.writeFile.call(this, filePath, data, opts, cb);
 };
 
 // Intercept fs.readFileSync - read from memory
-fs.readFileSync = function (filePath: any, options?: any) {
+fs.readFileSync = function (filePath: PathOrFileDescriptor, options?: ReadFileOptions) {
   if (isVirtualPath(filePath)) {
     const normalized = path.resolve(filePath);
     const content = virtualFiles.get(normalized);
 
     if (content === undefined) {
       // File doesn't exist in VFS
-      const err: any = new Error(`ENOENT: no such file or directory, open '${filePath}'`);
-      err.code = "ENOENT";
-      err.errno = -2;
-      err.syscall = "open";
-      err.path = filePath;
+      const err = Object.assign(
+        new Error(`ENOENT: no such file or directory, open '${filePath}'`),
+        { code: "ENOENT" as const, errno: -2, syscall: "open", path: String(filePath) },
+      );
       throw err;
     }
 
@@ -147,21 +162,23 @@ fs.readFileSync = function (filePath: any, options?: any) {
 };
 
 // Intercept fs.readFile (async)
-fs.readFile = function (filePath: any, options: any, callback?: any) {
-  if (typeof options === "function") {
-    callback = options;
-    options = undefined;
-  }
+fs.readFile = function (filePath: PathOrFileDescriptor, options: ReadFileOptions | ReadFileCallback, callback?: ReadFileCallback) {
+  const cb = typeof options === "function" ? options : callback;
+  const opts: ReadFileOptions | undefined = typeof options === "function" ? undefined : options;
 
   if (isVirtualPath(filePath)) {
     const normalized = path.resolve(filePath);
     const content = virtualFiles.get(normalized);
 
     if (content === undefined) {
-      const err: any = new Error(`ENOENT: no such file or directory, open '${filePath}'`);
-      err.code = "ENOENT";
-      if (callback) {
-        process.nextTick(callback, err);
+      const err = Object.assign(
+        new Error(`ENOENT: no such file or directory, open '${filePath}'`),
+        { code: "ENOENT" as const, errno: -2, syscall: "open", path: String(filePath) },
+      );
+      if (cb) {
+        process.nextTick(cb, err);
+      } else {
+        throw err;
       }
       return;
     }
@@ -177,20 +194,20 @@ fs.readFile = function (filePath: any, options: any, callback?: any) {
       });
     }
 
-    const encoding = typeof options === "string" ? options : options?.encoding;
+    const encoding = typeof opts === "string" ? opts : opts?.encoding;
     const result = encoding ? content : Buffer.from(content, "utf-8");
 
-    if (callback) {
-      process.nextTick(callback, null, result);
+    if (cb) {
+      process.nextTick(cb, null, result);
     }
     return;
   }
 
-  return orig.readFile.call(this, filePath, options, callback);
+  return orig.readFile.call(this, filePath, opts, cb);
 };
 
 // Intercept fs.renameSync - rename in virtual filesystem
-fs.renameSync = function (oldPath: any, newPath: any) {
+fs.renameSync = function (oldPath: PathLike, newPath: PathLike) {
   const oldVirtual = isVirtualPath(oldPath);
   const newVirtual = isVirtualPath(newPath);
 
@@ -208,7 +225,7 @@ fs.renameSync = function (oldPath: any, newPath: any) {
       content = orig.readFileSync.call(fs, oldPath, "utf-8");
       try {
         orig.unlinkSync.call(fs, oldPath);
-      } catch (unlinkErr: any) {
+      } catch (unlinkErr: unknown) {
         // Source cleanup failed after successful read — log but continue
         // since we already have the content for the virtual filesystem.
         if (process.send) {
@@ -216,7 +233,7 @@ fs.renameSync = function (oldPath: any, newPath: any) {
             type: "vfs_error",
             operation: "renameSync_unlink",
             path: oldNormalized,
-            error: unlinkErr?.message || String(unlinkErr),
+            error: unlinkErr instanceof Error ? unlinkErr.message : String(unlinkErr),
             timestamp: Date.now(),
           });
         }
@@ -247,7 +264,7 @@ fs.renameSync = function (oldPath: any, newPath: any) {
 };
 
 // Intercept fs.existsSync - check virtual filesystem first
-fs.existsSync = function (filePath: any) {
+fs.existsSync = function (filePath: PathLike) {
   if (isVirtualPath(filePath)) {
     const normalized = path.resolve(filePath);
     return virtualFiles.has(normalized);
@@ -257,14 +274,16 @@ fs.existsSync = function (filePath: any) {
 };
 
 // Intercept fs.statSync - fake stats for virtual files
-fs.statSync = function (filePath: any, options?: any) {
+fs.statSync = function (filePath: PathLike, options?: StatSyncOptions) {
   if (isVirtualPath(filePath)) {
     const normalized = path.resolve(filePath);
     const content = virtualFiles.get(normalized);
 
     if (content === undefined) {
-      const err: any = new Error(`ENOENT: no such file or directory, stat '${filePath}'`);
-      err.code = "ENOENT";
+      const err = Object.assign(
+        new Error(`ENOENT: no such file or directory, stat '${filePath}'`),
+        { code: "ENOENT" as const },
+      );
       throw err;
     }
 
@@ -303,14 +322,16 @@ fs.statSync = function (filePath: any, options?: any) {
 };
 
 // Intercept fs.unlinkSync - delete from virtual filesystem
-fs.unlinkSync = function (filePath: any) {
+fs.unlinkSync = function (filePath: PathLike) {
   if (isVirtualPath(filePath)) {
     const normalized = path.resolve(filePath);
     const existed = virtualFiles.delete(normalized);
 
     if (!existed) {
-      const err: any = new Error(`ENOENT: no such file or directory, unlink '${filePath}'`);
-      err.code = "ENOENT";
+      const err = Object.assign(
+        new Error(`ENOENT: no such file or directory, unlink '${filePath}'`),
+        { code: "ENOENT" as const },
+      );
       throw err;
     }
 
