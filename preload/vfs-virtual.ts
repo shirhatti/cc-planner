@@ -37,15 +37,40 @@ function isVirtualPath(filePath: PathOrFileDescriptor): boolean {
   return normalized.startsWith(PLANS_DIR);
 }
 
-// Send init message via IPC
-if (process.send) {
-  process.send({
-    type: "vfs_init",
-    plansDir: PLANS_DIR,
-    mode: "virtual",
-    timestamp: Date.now(),
+// Create a Node.js-style ENOENT error with proper errno fields.
+function makeEnoent(
+  syscall: string,
+  filePath: PathOrFileDescriptor | PathLike,
+): NodeJS.ErrnoException {
+  const p = String(filePath);
+  return Object.assign(new Error(`ENOENT: no such file or directory, ${syscall} '${p}'`), {
+    code: "ENOENT" as const,
+    errno: -2,
+    syscall,
+    path: p,
   });
 }
+
+// Send an IPC message to the parent process if an IPC channel exists.
+function sendIpc(msg: Record<string, unknown>): void {
+  if (process.send) {
+    process.send({ ...msg, timestamp: Date.now() });
+  }
+}
+
+// Convert write data (string or ArrayBufferView) to a UTF-8 string.
+function toContentString(data: string | NodeJS.ArrayBufferView): string {
+  return typeof data === "string"
+    ? data
+    : Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf-8");
+}
+
+// Send init message via IPC
+sendIpc({
+  type: "vfs_init",
+  plansDir: PLANS_DIR,
+  mode: "virtual",
+});
 
 // Store original methods
 const orig = {
@@ -67,32 +92,22 @@ fs.writeFileSync = function (
   options?: WriteFileOptions,
 ) {
   if (isVirtualPath(filePath)) {
-    const content =
-      typeof data === "string"
-        ? data
-        : Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf-8");
+    const content = toContentString(data);
     const normalized = path.resolve(filePath);
 
-    // Store in virtual filesystem
     virtualFiles.set(normalized, content);
 
-    // Broadcast write event
-    if (process.send) {
-      process.send({
-        type: "vfs_write",
-        path: normalized,
-        filename: path.basename(normalized),
-        content,
-        size: content.length,
-        timestamp: Date.now(),
-      });
-    }
+    sendIpc({
+      type: "vfs_write",
+      path: normalized,
+      filename: path.basename(normalized),
+      content,
+      size: content.length,
+    });
 
-    // Don't call original - file is virtual!
     return;
   }
 
-  // Non-virtual files go to disk
   return orig.writeFileSync.call(this, filePath, data, options);
 };
 
@@ -107,24 +122,18 @@ fs.writeFile = function (
   const opts = typeof options === "function" ? undefined : options;
 
   if (isVirtualPath(filePath)) {
-    const content =
-      typeof data === "string"
-        ? data
-        : Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf-8");
+    const content = toContentString(data);
     const normalized = path.resolve(filePath);
 
     virtualFiles.set(normalized, content);
 
-    if (process.send) {
-      process.send({
-        type: "vfs_write",
-        path: normalized,
-        filename: path.basename(normalized),
-        content,
-        size: content.length,
-        timestamp: Date.now(),
-      });
-    }
+    sendIpc({
+      type: "vfs_write",
+      path: normalized,
+      filename: path.basename(normalized),
+      content,
+      size: content.length,
+    });
 
     // Simulate async completion
     if (cb) {
@@ -143,24 +152,15 @@ fs.readFileSync = function (filePath: PathOrFileDescriptor, options?: ReadFileOp
     const content = virtualFiles.get(normalized);
 
     if (content === undefined) {
-      // File doesn't exist in VFS
-      const err = Object.assign(
-        new Error(`ENOENT: no such file or directory, open '${filePath}'`),
-        { code: "ENOENT" as const, errno: -2, syscall: "open", path: String(filePath) },
-      );
-      throw err;
+      throw makeEnoent("open", filePath);
     }
 
-    // Broadcast read event
-    if (process.send) {
-      process.send({
-        type: "vfs_read",
-        path: normalized,
-        filename: path.basename(normalized),
-        size: content.length,
-        timestamp: Date.now(),
-      });
-    }
+    sendIpc({
+      type: "vfs_read",
+      path: normalized,
+      filename: path.basename(normalized),
+      size: content.length,
+    });
 
     // Return from virtual filesystem
     const encoding = typeof options === "string" ? options : options?.encoding;
@@ -184,10 +184,7 @@ fs.readFile = function (
     const content = virtualFiles.get(normalized);
 
     if (content === undefined) {
-      const err = Object.assign(
-        new Error(`ENOENT: no such file or directory, open '${filePath}'`),
-        { code: "ENOENT" as const, errno: -2, syscall: "open", path: String(filePath) },
-      );
+      const err = makeEnoent("open", filePath);
       if (cb) {
         process.nextTick(cb, err);
       } else {
@@ -196,16 +193,12 @@ fs.readFile = function (
       return;
     }
 
-    // Broadcast read event only for files that exist
-    if (process.send) {
-      process.send({
-        type: "vfs_read",
-        path: normalized,
-        filename: path.basename(normalized),
-        size: content.length,
-        timestamp: Date.now(),
-      });
-    }
+    sendIpc({
+      type: "vfs_read",
+      path: normalized,
+      filename: path.basename(normalized),
+      size: content.length,
+    });
 
     const encoding = typeof opts === "string" ? opts : opts?.encoding;
     const result = encoding ? content : Buffer.from(content, "utf-8");
@@ -231,45 +224,38 @@ fs.renameSync = function (oldPath: PathLike, newPath: PathLike) {
     // Get content from virtual fs or disk
     let content: string | undefined;
     if (oldVirtual) {
+      // Case 1: virtual -> virtual
       content = virtualFiles.get(oldNormalized);
       virtualFiles.delete(oldNormalized);
     } else {
-      // Reading from disk, moving to virtual
+      // Case 2: disk -> virtual
       content = orig.readFileSync.call(fs, oldPath, "utf-8");
       try {
         orig.unlinkSync.call(fs, oldPath);
       } catch (unlinkErr: unknown) {
         // Source cleanup failed after successful read — log but continue
         // since we already have the content for the virtual filesystem.
-        if (process.send) {
-          process.send({
-            type: "vfs_error",
-            operation: "renameSync_unlink",
-            path: oldNormalized,
-            error: unlinkErr instanceof Error ? unlinkErr.message : String(unlinkErr),
-            timestamp: Date.now(),
-          });
-        }
+        sendIpc({
+          type: "vfs_error",
+          operation: "renameSync_unlink",
+          path: oldNormalized,
+          error: unlinkErr instanceof Error ? unlinkErr.message : String(unlinkErr),
+        });
       }
     }
 
     if (content && newVirtual) {
-      // Store with new name
       virtualFiles.set(newNormalized, content);
 
-      // Broadcast rename event with final content
-      if (process.send) {
-        process.send({
-          type: "plan_file_write",
-          path: newNormalized,
-          filename: path.basename(newNormalized),
-          content,
-          size: content.length,
-          timestamp: Date.now(),
-        });
-      }
+      sendIpc({
+        type: "plan_file_write",
+        path: newNormalized,
+        filename: path.basename(newNormalized),
+        content,
+        size: content.length,
+      });
 
-      return; // Don't touch disk
+      return;
     }
   }
 
@@ -293,11 +279,7 @@ fs.statSync = function (filePath: PathLike, options?: StatSyncOptions) {
     const content = virtualFiles.get(normalized);
 
     if (content === undefined) {
-      const err = Object.assign(
-        new Error(`ENOENT: no such file or directory, stat '${filePath}'`),
-        { code: "ENOENT" as const },
-      );
-      throw err;
+      throw makeEnoent("stat", filePath);
     }
 
     // Return fake stats
@@ -341,21 +323,14 @@ fs.unlinkSync = function (filePath: PathLike) {
     const existed = virtualFiles.delete(normalized);
 
     if (!existed) {
-      const err = Object.assign(
-        new Error(`ENOENT: no such file or directory, unlink '${filePath}'`),
-        { code: "ENOENT" as const },
-      );
-      throw err;
+      throw makeEnoent("unlink", filePath);
     }
 
-    if (process.send) {
-      process.send({
-        type: "vfs_unlink",
-        path: normalized,
-        filename: path.basename(normalized),
-        timestamp: Date.now(),
-      });
-    }
+    sendIpc({
+      type: "vfs_unlink",
+      path: normalized,
+      filename: path.basename(normalized),
+    });
 
     return;
   }
