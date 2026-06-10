@@ -32,13 +32,20 @@ function run(cmd: string, args: string[]): string {
   return res.stdout;
 }
 
+/** Whether a usable `gh` CLI is on PATH. */
+export function ghAvailable(): boolean {
+  const res = spawnSync("gh", ["--version"], { stdio: "ignore" });
+  return !res.error && res.status === 0;
+}
+
 export function bloblessClone(repo: string, dest: string, branch?: string): BloblessClone {
+  // Route credentials through gh (when present) so private repos work
+  // without extra setup; without gh, fall back to git's own credential setup.
+  const credentialArgs = ghAvailable()
+    ? ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"]
+    : [];
   run("git", [
-    // Route credentials through gh so private repos work without extra setup
-    "-c",
-    "credential.helper=",
-    "-c",
-    "credential.helper=!gh auth git-credential",
+    ...credentialArgs,
     "clone",
     "--filter=blob:none",
     "--no-checkout",
@@ -51,10 +58,11 @@ export function bloblessClone(repo: string, dest: string, branch?: string): Blob
 }
 
 /** Env vars that configure preload/vfs-hydrate.ts for this clone. */
-export function hydrateEnv(clone: BloblessClone): Record<string, string> {
+export function hydrateEnv(clone: BloblessClone, strategy: "gh" | "git"): Record<string, string> {
   return {
     CC_HYDRATE_ROOT: clone.root,
     CC_HYDRATE_REPO: clone.repo,
     CC_HYDRATE_REF: clone.ref,
+    CC_HYDRATE_STRATEGY: strategy,
   };
 }

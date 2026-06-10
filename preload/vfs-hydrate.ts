@@ -12,11 +12,14 @@
  * subprocesses like ripgrep — hits the hydrated copy.
  *
  * Configuration (env vars):
- * - CC_HYDRATE_ROOT  (required) absolute path of the blob-less working tree.
- *                    If unset, this preload is inert.
- * - CC_HYDRATE_REPO  "owner/repo" on GitHub. Defaults to parsing the
- *                    `origin` remote URL.
- * - CC_HYDRATE_REF   commit-ish to hydrate from. Defaults to HEAD's sha.
+ * - CC_HYDRATE_ROOT     (required) absolute path of the blob-less working
+ *                       tree. If unset, this preload is inert.
+ * - CC_HYDRATE_REPO     "owner/repo" on GitHub. Defaults to parsing the
+ *                       `origin` remote URL.
+ * - CC_HYDRATE_REF      commit-ish to hydrate from. Defaults to HEAD's sha.
+ * - CC_HYDRATE_STRATEGY "gh" (default) fetches via the GitHub contents API;
+ *                       "git" lazily fetches blobs from the promisor remote
+ *                       instead, for environments without a usable gh CLI.
  */
 
 const fs = require("node:fs");
@@ -61,17 +64,24 @@ function install(rootInput: string): void {
     return res.stdout;
   }
 
+  // "gh" fetches through the GitHub contents API; "git" lazily fetches blobs
+  // from the promisor remote (works wherever the clone itself worked, e.g.
+  // sandboxes that proxy git but block api.github.com).
+  const STRATEGY: "gh" | "git" = process.env.CC_HYDRATE_STRATEGY === "git" ? "git" : "gh";
+
   const REPO =
     process.env.CC_HYDRATE_REPO ??
-    (() => {
-      const repo = parseGitHubRepo(git(["remote", "get-url", "origin"]));
-      if (!repo) {
-        throw new Error(
-          "vfs-hydrate: could not derive owner/repo from the origin remote; set CC_HYDRATE_REPO",
-        );
-      }
-      return repo;
-    })();
+    (STRATEGY === "git"
+      ? "" // not needed: git strategy addresses content by ref, not by repo
+      : (() => {
+          const repo = parseGitHubRepo(git(["remote", "get-url", "origin"]));
+          if (!repo) {
+            throw new Error(
+              "vfs-hydrate: could not derive owner/repo from the origin remote; set CC_HYDRATE_REPO",
+            );
+          }
+          return repo;
+        })());
   const REF = process.env.CC_HYDRATE_REF ?? git(["rev-parse", "HEAD"]).trim();
 
   // -------------------------------------------------------------------------
@@ -179,11 +189,14 @@ function install(rootInput: string): void {
   // Hydration
   // -------------------------------------------------------------------------
 
-  function hydrate(rel: string, abs: string): void {
-    const entry = files.get(rel);
-    if (!entry) return;
-
-    const res = spawnSync(
+  function fetchCommand(rel: string): [string, string[]] {
+    if (STRATEGY === "git") {
+      // Blob-less clones are promisor clones: cat-file on a missing blob
+      // makes git fetch just that object from origin, reusing whatever
+      // credentials/proxy the clone itself used.
+      return ["git", ["-C", ROOT, "cat-file", "blob", `${REF}:${rel}`]];
+    }
+    return [
       "gh",
       [
         "api",
@@ -191,17 +204,24 @@ function install(rootInput: string): void {
         "-H",
         "Accept: application/vnd.github.raw+json",
       ],
-      { maxBuffer: 256 * 1024 * 1024 },
-    );
+    ];
+  }
+
+  function hydrate(rel: string, abs: string): void {
+    const entry = files.get(rel);
+    if (!entry) return;
+
+    const [cmd, args] = fetchCommand(rel);
+    const res = spawnSync(cmd, args, { maxBuffer: 256 * 1024 * 1024 });
 
     if (res.error) {
       sendIpc({ type: "hydrate_error", path: abs, rel, error: String(res.error) });
-      throw new Error(`vfs-hydrate: failed to run gh for '${rel}': ${res.error}`);
+      throw new Error(`vfs-hydrate: failed to run ${cmd} for '${rel}': ${res.error}`);
     }
     if (res.status !== 0) {
       const stderr = (res.stderr?.toString("utf-8") ?? "").trim();
       sendIpc({ type: "hydrate_error", path: abs, rel, error: stderr });
-      throw Object.assign(new Error(`vfs-hydrate: gh api fetch failed for '${rel}': ${stderr}`), {
+      throw Object.assign(new Error(`vfs-hydrate: ${cmd} fetch failed for '${rel}': ${stderr}`), {
         code: "EIO",
         path: abs,
       });
@@ -524,6 +544,7 @@ function install(rootInput: string): void {
   sendIpc({
     type: "hydrate_init",
     mode: "hydrate",
+    strategy: STRATEGY,
     root: ROOT,
     repo: REPO,
     ref: REF,

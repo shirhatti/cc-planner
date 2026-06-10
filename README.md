@@ -164,15 +164,23 @@ The blob-less clone is an internal implementation detail — you never interact 
 
 Authentication for private repos is delegated entirely to the `gh` CLI (`gh auth login`), both for the initial clone (via `gh auth git-credential`) and for content fetches (via `gh api`).
 
+### Hydration Strategies
+
+Two fetch strategies are supported; `planRemoteRepo()` picks automatically:
+
+- **`gh`** (default when the gh CLI is available) — fetches file contents through the GitHub contents API. Requires `gh` on PATH and network access to `api.github.com`.
+- **`git`** — exploits the fact that a blob-less clone is a _promisor_ clone: `git cat-file blob <ref>:<path>` makes git lazily fetch exactly that blob from origin, reusing whatever credentials or proxy the clone itself used. No gh CLI needed; works anywhere the clone worked (e.g., sandboxes that proxy git traffic but block `api.github.com`).
+
 ### Configuration
 
 `preload/vfs-hydrate.ts` is configured via env vars (set automatically by `planRemoteRepo()`):
 
-| Variable          | Required | Description                                                   |
-| ----------------- | -------- | ------------------------------------------------------------- |
-| `CC_HYDRATE_ROOT` | yes      | Path of the blob-less working tree. Unset = preload is inert. |
-| `CC_HYDRATE_REPO` | no       | `owner/repo`; defaults to parsing the `origin` remote URL.    |
-| `CC_HYDRATE_REF`  | no       | Commit to hydrate from; defaults to `HEAD`'s sha.             |
+| Variable              | Required | Description                                                   |
+| --------------------- | -------- | ------------------------------------------------------------- |
+| `CC_HYDRATE_ROOT`     | yes      | Path of the blob-less working tree. Unset = preload is inert. |
+| `CC_HYDRATE_REPO`     | no       | `owner/repo`; defaults to parsing the `origin` remote URL.    |
+| `CC_HYDRATE_REF`      | no       | Commit to hydrate from; defaults to `HEAD`'s sha.             |
+| `CC_HYDRATE_STRATEGY` | no       | `gh` (contents API, default) or `git` (promisor lazy fetch).  |
 
 ### Limitations
 
@@ -205,6 +213,14 @@ The example at `scripts/sdk-example.ts` demonstrates this with a `buildChildEnv(
 
 ```bash
 bun run scripts/sdk-example.ts
+```
+
+### GitHub Access Inside the Sandbox
+
+Sandboxes typically have no `gh` CLI and block `api.github.com` at the egress proxy, while still allowing git traffic to `github.com` (and/or routing it through a local credential-injecting proxy for the session's authorized repos). The hydrating VFS handles this automatically: `planRemoteRepo()` detects that `gh` is unavailable and falls back to the `git` hydration strategy, which fetches blobs through the same channel the blob-less clone used. No extra GitHub auth setup is needed:
+
+```bash
+bun run scripts/plan-remote-repo.ts owner/repo "Create a plan for ..."
 ```
 
 ## IPC Events

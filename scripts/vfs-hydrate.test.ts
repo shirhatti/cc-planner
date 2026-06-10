@@ -66,8 +66,9 @@ beforeAll(() => {
   git(upstream, "config", "user.name", "Test");
   // Fixture commits must work even where a global config enforces signing
   git(upstream, "config", "commit.gpgsign", "false");
-  // Allow partial clones from this repo over the local transport
+  // Allow partial clones and promisor blob fetches over the local transport
   git(upstream, "config", "uploadpack.allowFilter", "true");
+  git(upstream, "config", "uploadpack.allowAnySHA1InWant", "true");
 
   writeFileSync(path.join(upstream, "README.md"), "# Widgets\n");
   mkdirSync(path.join(upstream, "src", "util"), { recursive: true });
@@ -454,6 +455,30 @@ test("hydrating VFS - paths outside the root pass through untouched", async () =
   expect(stdout).toContain("outside:outside content");
   expect(ghCalls(fixture).length).toBe(0);
   expect(events.filter((e) => e.type === "hydrate_fetch").length).toBe(0);
+});
+
+test("hydrating VFS - git strategy fetches blobs from the promisor remote without gh", async () => {
+  const fixture = freshClone();
+  fixture.env.CC_HYDRATE_STRATEGY = "git";
+  const target = path.join(fixture.root, "src", "index.ts");
+
+  const { exitCode, stdout, events } = await runHydrated(
+    `
+    const fs = require('fs');
+    console.log("read:" + fs.readFileSync(${JSON.stringify(target)}, "utf-8").trim());
+  `,
+    fixture,
+  );
+
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain("read:export const answer = 42;");
+  // gh was never invoked — content came through git's lazy promisor fetch
+  expect(ghCalls(fixture).length).toBe(0);
+  expect(readFileSync(target, "utf-8")).toBe("export const answer = 42;\n");
+
+  const init = events.find((e) => e.type === "hydrate_init");
+  expect(init?.strategy).toBe("git");
+  expect(events.find((e) => e.type === "hydrate_fetch")?.rel).toBe("src/index.ts");
 });
 
 test("hydrating VFS - composes with the plan-file VFS preload", async () => {
