@@ -10,6 +10,7 @@ import "./components/cc-start-form.js";
 import "./components/cc-feed.js";
 import "./components/cc-plan-panel.js";
 import "./components/cc-settings-panel.js";
+import "./components/cc-stats-panel.js";
 
 export class CcApp extends HTMLElement {
   connectedCallback() {
@@ -32,6 +33,7 @@ export class CcApp extends HTMLElement {
           </section>
           <section class="right">
             <cc-plan-panel></cc-plan-panel>
+            <cc-stats-panel></cc-stats-panel>
           </section>
         </main>
       </div>`;
@@ -42,6 +44,7 @@ export class CcApp extends HTMLElement {
     this.startForm = this.querySelector("cc-start-form");
     this.feeds = this.querySelector(".feeds");
     this.planPanel = this.querySelector("cc-plan-panel");
+    this.statsPanel = this.querySelector("cc-stats-panel");
 
     this.config = { mode: "lazy" };
     /** @type {Map<string, object>} session id -> record */
@@ -129,6 +132,7 @@ export class CcApp extends HTMLElement {
       prompt,
       status: "starting",
       createdAt: Date.now(),
+      startedAt: Date.now(),
     });
 
     const feed = document.createElement("cc-feed");
@@ -241,6 +245,11 @@ export class CcApp extends HTMLElement {
         );
         this.updateStatus(msg.sessionId, msg.approved ? "approved" : "running");
         break;
+      case "session_stats":
+        record.stats = msg.stats;
+        if (msg.stats.final) this.persist(record);
+        if (isActive) this.statsPanel.showSession(record);
+        break;
       case "result":
         if (msg.result) feed.addAssistant(msg.result);
         if (msg.costUsd != null) {
@@ -315,6 +324,7 @@ export class CcApp extends HTMLElement {
 
     this.planPanel.dataset.sessionId = id;
     this.planPanel.showSession(record);
+    this.statsPanel.showSession(record);
     this.startForm.showSession(record);
     this.statusEl.textContent = record?.status === "draft" ? "" : (record?.status ?? "");
     this.renderList();

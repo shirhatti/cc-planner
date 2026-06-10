@@ -21,6 +21,36 @@ export interface AuthConfig {
   authToken?: string;
 }
 
+/** Token counts by type. */
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+}
+
+/**
+ * Session statistics. Streamed with `final: false` as usage accumulates from
+ * each assistant turn, then once with `final: true` from the SDK's
+ * authoritative result message.
+ */
+export interface SessionStats {
+  durationMs: number;
+  /** Time spent waiting on the API (final stats only). */
+  apiDurationMs?: number;
+  /** Number of agentic turns (final stats only). */
+  numTurns?: number;
+  /** Total cost in USD (final stats only). */
+  costUsd?: number;
+  totals: TokenUsage;
+  byModel: Record<string, TokenUsage & { costUsd?: number }>;
+  /** Repo files hydrated on demand (lazy hydration mode only). */
+  filesHydrated: number;
+  /** Bytes of repo content fetched during hydration (lazy mode only). */
+  bytesFetched: number;
+  final: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Browser -> server
 // ---------------------------------------------------------------------------
@@ -74,6 +104,8 @@ export type SessionEvent =
   /** Claude called ExitPlanMode — approve or request changes. */
   | { type: "plan_review"; id: string; allowedPrompts: { tool: string; prompt: string }[] }
   | { type: "plan_decided"; approved: boolean }
+  /** Live (and finally authoritative) duration/token/cost statistics. */
+  | { type: "session_stats"; stats: SessionStats }
   | { type: "result"; subtype: string; result?: string; costUsd?: number; durationMs?: number }
   | { type: "session_done" }
   | { type: "error"; message: string };

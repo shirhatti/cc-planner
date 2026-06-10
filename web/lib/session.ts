@@ -15,7 +15,14 @@ import type { CanUseTool, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { planBakedRepo, resolveBakedRef } from "../../scripts/lib/plan-baked";
 import { planRemoteRepo } from "../../scripts/lib/plan-remote";
 import type { VfsMessage } from "../../scripts/lib/spawn-vfs";
-import type { AuthConfig, ClientMessage, SessionEvent, UserQuestion } from "./protocol";
+import type {
+  AuthConfig,
+  ClientMessage,
+  SessionEvent,
+  SessionStats,
+  TokenUsage,
+  UserQuestion,
+} from "./protocol";
 
 // ---------------------------------------------------------------------------
 // Repo mode: baked (full repo in the image) vs lazy (blob-less clone + hydration)
@@ -115,6 +122,38 @@ export function summarizeToolInput(input: Record<string, unknown>): string {
   return "";
 }
 
+// ---------------------------------------------------------------------------
+// Session statistics
+// ---------------------------------------------------------------------------
+
+/** Raw per-API-call usage as reported on SDK messages (snake_case). */
+interface RawUsage {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+}
+
+export function emptyUsage(): TokenUsage {
+  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+}
+
+export function usageFromRaw(raw: RawUsage | undefined): TokenUsage {
+  return {
+    inputTokens: raw?.input_tokens ?? 0,
+    outputTokens: raw?.output_tokens ?? 0,
+    cacheReadTokens: raw?.cache_read_input_tokens ?? 0,
+    cacheCreationTokens: raw?.cache_creation_input_tokens ?? 0,
+  };
+}
+
+function addUsage(target: TokenUsage, delta: TokenUsage): void {
+  target.inputTokens += delta.inputTokens;
+  target.outputTokens += delta.outputTokens;
+  target.cacheReadTokens += delta.cacheReadTokens;
+  target.cacheCreationTokens += delta.cacheCreationTokens;
+}
+
 interface PendingRequest {
   resolve: (msg: ClientMessage) => void;
   reject: (err: Error) => void;
@@ -126,6 +165,11 @@ export class PlanSession {
   private session?: RunnerResult["session"];
   private started = false;
   private planApproved = false;
+  private startedAt = 0;
+  private readonly liveTotals = emptyUsage();
+  private readonly liveByModel = new Map<string, TokenUsage>();
+  private filesHydrated = 0;
+  private bytesFetched = 0;
 
   constructor(
     private readonly send: (msg: SessionEvent) => void,
@@ -143,6 +187,7 @@ export class PlanSession {
       return;
     }
     this.started = true;
+    this.startedAt = Date.now();
 
     try {
       const { session, repo, ref } = this.runner({
@@ -277,8 +322,27 @@ export class PlanSession {
     if (msg.type === "hydrate_init") {
       this.send({ type: "hydrate_init", files: Number(msg.files) });
     } else if (msg.type === "hydrate_fetch") {
+      this.filesHydrated += 1;
+      this.bytesFetched += Number(msg.size) || 0;
       this.send({ type: "hydrate_fetch", rel: String(msg.rel), size: Number(msg.size) });
+      this.sendLiveStats();
     }
+  }
+
+  private sendLiveStats(): void {
+    this.send({
+      type: "session_stats",
+      stats: {
+        durationMs: Date.now() - this.startedAt,
+        totals: { ...this.liveTotals },
+        byModel: Object.fromEntries(
+          [...this.liveByModel].map(([model, usage]) => [model, { ...usage }]),
+        ),
+        filesHydrated: this.filesHydrated,
+        bytesFetched: this.bytesFetched,
+        final: false,
+      },
+    });
   }
 
   private handleSdkMessage(msg: SDKMessage): void {
@@ -288,7 +352,7 @@ export class PlanSession {
           this.send({ type: "session_init", model: msg.model });
         }
         break;
-      case "assistant":
+      case "assistant": {
         for (const block of msg.message.content) {
           if (block.type === "text" && block.text.trim()) {
             this.send({ type: "assistant_text", text: block.text });
@@ -300,8 +364,43 @@ export class PlanSession {
             });
           }
         }
+        const usage = msg.message.usage as RawUsage | undefined;
+        if (usage) {
+          const delta = usageFromRaw(usage);
+          addUsage(this.liveTotals, delta);
+          const model = msg.message.model ?? "unknown";
+          const modelUsage = this.liveByModel.get(model) ?? emptyUsage();
+          addUsage(modelUsage, delta);
+          this.liveByModel.set(model, modelUsage);
+          this.sendLiveStats();
+        }
         break;
-      case "result":
+      }
+      case "result": {
+        const byModel: SessionStats["byModel"] = {};
+        for (const [model, usage] of Object.entries(msg.modelUsage ?? {})) {
+          byModel[model] = {
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            cacheReadTokens: usage.cacheReadInputTokens,
+            cacheCreationTokens: usage.cacheCreationInputTokens,
+            costUsd: usage.costUSD,
+          };
+        }
+        this.send({
+          type: "session_stats",
+          stats: {
+            durationMs: msg.duration_ms,
+            apiDurationMs: msg.duration_api_ms,
+            numTurns: msg.num_turns,
+            costUsd: msg.total_cost_usd,
+            totals: usageFromRaw(msg.usage as RawUsage | undefined),
+            byModel,
+            filesHydrated: this.filesHydrated,
+            bytesFetched: this.bytesFetched,
+            final: true,
+          },
+        });
         this.send({
           type: "result",
           subtype: msg.subtype,
@@ -310,6 +409,7 @@ export class PlanSession {
           durationMs: msg.duration_ms,
         });
         break;
+      }
     }
   }
 }
