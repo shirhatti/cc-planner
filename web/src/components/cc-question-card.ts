@@ -5,8 +5,21 @@
  * keyed by question text, matching the tool's expected input.
  */
 
+import type { UserQuestion } from "../../lib/protocol";
+
+export interface AnswerQuestionDetail {
+  id: string;
+  answers: Record<string, string>;
+}
+
 export class CcQuestionCard extends HTMLElement {
-  setData({ id, questions }) {
+  private toolUseId = "";
+  private questions: UserQuestion[] = [];
+  private selections: Set<string>[] = [];
+  private others: string[] = [];
+  private submitBtn?: HTMLButtonElement;
+
+  setData({ id, questions }: { id: string; questions: UserQuestion[] }): void {
     this.toolUseId = id;
     this.questions = questions;
     this.selections = questions.map(() => new Set());
@@ -14,7 +27,7 @@ export class CcQuestionCard extends HTMLElement {
     this.render();
   }
 
-  render() {
+  private render(): void {
     this.innerHTML = "";
     this.classList.add("question-card");
 
@@ -58,7 +71,7 @@ export class CcQuestionCard extends HTMLElement {
     this.append(row);
   }
 
-  toggle(qi, label, div, multiSelect) {
+  private toggle(qi: number, label: string, div: HTMLElement, multiSelect?: boolean): void {
     if (this.classList.contains("answered")) return;
     if (multiSelect) {
       if (this.selections[qi].has(label)) this.selections[qi].delete(label);
@@ -73,22 +86,26 @@ export class CcQuestionCard extends HTMLElement {
     }
   }
 
-  submit() {
-    const answers = {};
+  private submit(): void {
+    const answers: Record<string, string> = {};
     this.questions.forEach((q, qi) => {
       const picked = [...this.selections[qi]];
       if (this.others[qi].trim()) picked.push(this.others[qi].trim());
       if (picked.length) answers[q.question] = picked.join(", ");
     });
     if (Object.keys(answers).length < this.questions.length) {
-      this.submitBtn.textContent = "Answer every question first";
-      setTimeout(() => (this.submitBtn.textContent = "Submit answers"), 1500);
+      if (this.submitBtn) {
+        this.submitBtn.textContent = "Answer every question first";
+        setTimeout(() => {
+          if (this.submitBtn) this.submitBtn.textContent = "Submit answers";
+        }, 1500);
+      }
       return;
     }
     this.classList.add("answered");
     this.querySelector(".submit-row")?.remove();
     this.dispatchEvent(
-      new CustomEvent("answer-question", {
+      new CustomEvent<AnswerQuestionDetail>("answer-question", {
         bubbles: true,
         detail: { id: this.toolUseId, answers },
       }),
@@ -97,3 +114,9 @@ export class CcQuestionCard extends HTMLElement {
 }
 
 customElements.define("cc-question-card", CcQuestionCard);
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "cc-question-card": CcQuestionCard;
+  }
+}

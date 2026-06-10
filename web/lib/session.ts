@@ -1,18 +1,28 @@
 /**
- * PlanSession — bridges one Claude Code plan-mode session to one browser
- * WebSocket connection.
+ * ClaudeSession — bridges one interactive, multi-turn Claude Code session to
+ * one browser client. This is the server half of the web TTY: the browser
+ * sends user messages and permission decisions; the session streams back
+ * assistant output, tool activity, plan content, and stats.
  *
- * - SDK/VFS events (assistant text, tool activity, hydration, live plan
- *   content) are forwarded to the browser as ServerMessages.
- * - canUseTool intercepts AskUserQuestion and ExitPlanMode, forwards them to
- *   the browser, and blocks until the user responds in the UI.
- * - On plan approval the session is interrupted: the approved plan is the
- *   deliverable, so Claude never proceeds to implementation.
+ * - Input is a stream: the first prompt starts the session and follow-up
+ *   user_message events queue further turns, exactly like typing into the
+ *   CLI.
+ * - canUseTool routes every gated tool call to the browser: AskUserQuestion
+ *   renders as question cards, ExitPlanMode as a plan review, and everything
+ *   else (Bash, Edit, Write, ...) as allow/deny permission cards.
+ * - In the classic planner workflow (stopOnPlanApproval), approving the plan
+ *   ends the session — the plan is the deliverable. Otherwise approval lets
+ *   Claude continue into implementation under browser-prompted permissions.
  */
 
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import path from "path";
-import type { CanUseTool, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  CanUseTool,
+  PermissionMode,
+  SDKMessage,
+  SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import { planBakedRepo, resolveBakedRef } from "../../scripts/lib/plan-baked";
 import { planRemoteRepo } from "../../scripts/lib/plan-remote";
 import type { VfsMessage } from "../../scripts/lib/spawn-vfs";
@@ -20,7 +30,9 @@ import { estimateModelCostUsd } from "./pricing";
 import type {
   AuthConfig,
   ClientMessage,
+  DiffPayload,
   SessionEvent,
+  SessionMode,
   SessionStats,
   TokenUsage,
   UserQuestion,
@@ -54,11 +66,59 @@ export function resolveRepoMode(env: Record<string, string | undefined> = proces
 }
 
 // ---------------------------------------------------------------------------
+// Streaming input
+// ---------------------------------------------------------------------------
+
+export function makeUserMessage(text: string): SDKUserMessage {
+  return {
+    type: "user",
+    message: { role: "user", content: [{ type: "text", text }] },
+    parent_tool_use_id: null,
+    session_id: "",
+  };
+}
+
+/** Unbounded push queue exposed as the SDK's streaming-input iterable. */
+export class InputQueue implements AsyncIterable<SDKUserMessage> {
+  private readonly queue: SDKUserMessage[] = [];
+  private readonly waiters: ((result: IteratorResult<SDKUserMessage>) => void)[] = [];
+  private closed = false;
+
+  push(text: string): void {
+    if (this.closed) return;
+    const msg = makeUserMessage(text);
+    const waiter = this.waiters.shift();
+    if (waiter) waiter({ done: false, value: msg });
+    else this.queue.push(msg);
+  }
+
+  /** Signal end of input — the CLI finishes the current turn and exits. */
+  done(): void {
+    this.closed = true;
+    for (const waiter of this.waiters.splice(0)) {
+      waiter({ done: true, value: undefined });
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
+    return {
+      next: () => {
+        const value = this.queue.shift();
+        if (value) return Promise.resolve({ done: false, value });
+        if (this.closed) return Promise.resolve({ done: true, value: undefined });
+        return new Promise((resolve) => this.waiters.push(resolve));
+      },
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Session runner — injectable so tests don't spawn a real claude process
 // ---------------------------------------------------------------------------
 
 export interface RunnerArgs {
-  prompt: string;
+  prompt: string | AsyncIterable<SDKUserMessage>;
+  permissionMode?: PermissionMode;
   repo?: string;
   branch?: string;
   canUseTool: CanUseTool;
@@ -105,7 +165,7 @@ export function gatewayEnv(auth?: AuthConfig): Record<string, string> {
 }
 
 // ---------------------------------------------------------------------------
-// PlanSession
+// ClaudeSession
 // ---------------------------------------------------------------------------
 
 const REJECTION_FALLBACK =
@@ -122,6 +182,45 @@ export function summarizeToolInput(input: Record<string, unknown>): string {
     }
   }
   return "";
+}
+
+/** Largest file content (bytes) included in a diff payload. */
+const DIFF_MAX_BYTES = 200_000;
+
+/**
+ * Extract a renderable file diff from an Edit/Write tool input. For Write,
+ * the old text is read from disk (in the session workspace) when the file
+ * already exists, so overwrites render as a change rather than an addition.
+ */
+export function extractDiff(
+  toolName: string,
+  input: Record<string, unknown>,
+): DiffPayload | undefined {
+  const filePath = input.file_path;
+  if (typeof filePath !== "string" || !filePath) return undefined;
+
+  if (toolName === "Edit") {
+    return {
+      filePath,
+      oldText: typeof input.old_string === "string" ? input.old_string : "",
+      newText: typeof input.new_string === "string" ? input.new_string : "",
+    };
+  }
+  if (toolName === "Write") {
+    let oldText = "";
+    try {
+      const existing = readFileSync(filePath, "utf-8");
+      if (existing.length <= DIFF_MAX_BYTES) oldText = existing;
+    } catch {
+      // New file — render as a pure addition.
+    }
+    return {
+      filePath,
+      oldText,
+      newText: typeof input.content === "string" ? input.content : "",
+    };
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,12 +260,23 @@ interface PendingRequest {
   reject: (err: Error) => void;
 }
 
-export class PlanSession {
+export interface StartRequest {
+  prompt: string;
+  repo?: string;
+  branch?: string;
+  mode?: SessionMode;
+  stopOnPlanApproval?: boolean;
+  auth?: AuthConfig;
+}
+
+export class ClaudeSession {
   private readonly pending = new Map<string, PendingRequest>();
   private readonly abort = new AbortController();
+  private readonly input = new InputQueue();
   private session?: RunnerResult["session"];
   private started = false;
   private planApproved = false;
+  private stopOnPlanApproval = true;
   private startedAt = 0;
   /**
    * Usage per API call, keyed by message id. The SDK can emit several
@@ -183,22 +293,22 @@ export class PlanSession {
     private readonly runner: SessionRunner,
   ) {}
 
-  async start(req: {
-    prompt: string;
-    repo?: string;
-    branch?: string;
-    auth?: AuthConfig;
-  }): Promise<void> {
+  async start(req: StartRequest): Promise<void> {
     if (this.started) {
-      this.send({ type: "error", message: "A session is already running on this connection" });
+      this.send({ type: "error", message: "Session already started" });
       return;
     }
     this.started = true;
     this.startedAt = Date.now();
 
+    const mode: SessionMode = req.mode ?? "plan";
+    this.stopOnPlanApproval = mode === "plan" && (req.stopOnPlanApproval ?? true);
+    this.input.push(req.prompt);
+
     try {
       const { session, repo, ref } = this.runner({
-        prompt: req.prompt,
+        prompt: this.input,
+        permissionMode: mode,
         repo: req.repo,
         branch: req.branch,
         extraEnv: gatewayEnv(req.auth),
@@ -215,20 +325,25 @@ export class PlanSession {
       }
       this.send({ type: "session_done" });
     } catch (err) {
-      // An abort after plan approval (or a user interrupt) is a clean stop.
+      // An abort after plan approval (or disposing the session) is a clean stop.
       if (this.planApproved || this.abort.signal.aborted) {
         this.send({ type: "session_done" });
       } else {
         this.send({ type: "error", message: err instanceof Error ? err.message : String(err) });
       }
     } finally {
+      this.input.done();
       this.failPending(new Error("Session ended"));
     }
   }
 
   handleClientMessage(msg: ClientMessage): void {
     switch (msg.type) {
+      case "user_message":
+        this.input.push(msg.text);
+        break;
       case "answer_question":
+      case "permission_decision":
       case "plan_decision": {
         const pending = this.pending.get(msg.id);
         if (pending) {
@@ -238,14 +353,20 @@ export class PlanSession {
         break;
       }
       case "interrupt":
-        this.dispose();
+        // Stop the turn in progress; the session stays open for more input.
+        this.failPending(new Error("Turn interrupted"));
+        this.session?.interrupt?.().catch(() => {});
+        break;
+      case "end_session":
+        this.input.done();
         break;
     }
   }
 
-  /** Abort the session and unblock any pending browser round-trips. */
+  /** Abort the session entirely and unblock any pending browser round-trips. */
   dispose(): void {
     this.failPending(new Error("Session aborted"));
+    this.input.done();
     this.abort.abort();
   }
 
@@ -285,18 +406,53 @@ export class PlanSession {
       this.send({ type: "plan_decided", approved });
 
       if (approved) {
-        this.planApproved = true;
-        // Allow the tool call to resolve, then stop before implementation.
-        setTimeout(() => this.stopSession(), 0);
+        if (this.stopOnPlanApproval) {
+          // Planner workflow: the approved plan is the deliverable. Allow the
+          // tool call to resolve, then stop before implementation.
+          this.planApproved = true;
+          setTimeout(() => this.stopSession(), 0);
+        }
         return { behavior: "allow", updatedInput: input };
       }
       return { behavior: "deny", message: decision?.feedback?.trim() || REJECTION_FALLBACK };
     }
 
-    return { behavior: "allow", updatedInput: input };
+    // Every other gated tool (Bash, Edit, Write, ...) becomes an allow/deny
+    // card in the browser. Edit/Write carry a diff so the change can be
+    // reviewed before allowing it.
+    const reply = await this.waitForClient(
+      {
+        type: "permission_request",
+        id: toolUseID,
+        toolName,
+        detail: summarizeToolInput(input),
+        diff: extractDiff(toolName, input),
+      },
+      toolUseID,
+      signal,
+    );
+    const decision = reply.type === "permission_decision" ? reply : undefined;
+    if (decision?.allow) {
+      return {
+        behavior: "allow",
+        updatedInput: input,
+        updatedPermissions: decision.always
+          ? [
+              {
+                type: "addRules",
+                rules: [{ toolName }],
+                behavior: "allow",
+                destination: "session",
+              },
+            ]
+          : undefined,
+      };
+    }
+    return { behavior: "deny", message: "The user denied this tool call." };
   };
 
   private stopSession(): void {
+    this.input.done();
     const session = this.session;
     if (session?.interrupt) {
       session.interrupt().catch(() => this.abort.abort());
@@ -394,10 +550,12 @@ export class PlanSession {
           if (block.type === "text" && block.text.trim()) {
             this.send({ type: "assistant_text", text: block.text });
           } else if (block.type === "tool_use" && !INTERACTIVE_TOOLS.has(block.name)) {
+            const input = block.input as Record<string, unknown>;
             this.send({
               type: "tool_activity",
               name: block.name,
-              detail: summarizeToolInput(block.input as Record<string, unknown>),
+              detail: summarizeToolInput(input),
+              diff: extractDiff(block.name, input),
             });
           }
         }
@@ -412,9 +570,9 @@ export class PlanSession {
         break;
       }
       case "result": {
-        // Final stats use the SDK's authoritative token counts, but cost is
-        // always estimated from public pricing — the SDK's own cost figure
-        // is never shown.
+        // Per-turn stats use the SDK's authoritative (session-cumulative)
+        // token counts, but cost is always estimated from public pricing —
+        // the SDK's own cost figure is never shown.
         const byModel: SessionStats["byModel"] = {};
         let estimatedTotal: number | undefined;
         for (const [model, usage] of Object.entries(msg.modelUsage ?? {})) {

@@ -1,4 +1,5 @@
-# cc-planner web app.
+# Claude Code Web TTY — browser client for Claude Code sessions, built on
+# the cc-planner VFS infra for its repo workspaces.
 #
 # Lazy hydration (default):
 #   docker build -t cc-planner .
@@ -25,10 +26,12 @@ COPY package.json bun.lock ./
 # --ignore-scripts: skips the husky "prepare" hook, which needs a .git dir
 RUN bun install --frozen-lockfile --ignore-scripts
 
-COPY tsconfig.json ./
+COPY tsconfig.json vite.config.ts ./
 COPY preload ./preload
 COPY scripts ./scripts
 COPY web ./web
+
+RUN bun run build
 
 ARG BAKE_REPO=
 ARG BAKE_REF=

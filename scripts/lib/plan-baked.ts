@@ -1,14 +1,21 @@
 /**
- * Run a Claude Code plan-mode session against a repo that is already fully
- * present on disk — e.g. one baked into the container image at build time
- * (see Dockerfile, BAKE_REPO build arg).
+ * Run a Claude Code session against a repo that is already fully present on
+ * disk — e.g. one baked into the container image at build time (see
+ * Dockerfile, BAKE_REPO build arg). Defaults to plan mode, but any
+ * permission mode works.
  *
  * Unlike planRemoteRepo() there is no blob-less clone and no hydration:
  * every file is already on disk, so only the plan-file VFS
  * (preload/vfs-virtual.ts) is injected to stream plan content over IPC.
  */
 
-import { query, type CanUseTool, type Query } from "@anthropic-ai/claude-agent-sdk";
+import {
+  query,
+  type CanUseTool,
+  type PermissionMode,
+  type Query,
+  type SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import { spawnSync } from "child_process";
 import { existsSync } from "fs";
 import path from "path";
@@ -22,13 +29,15 @@ const VFS_VIRTUAL = path.join(__dirname, "..", "..", "preload", "vfs-virtual.ts"
 export interface BakedPlanOptions {
   /** Absolute path of the checked-out repo (e.g. /repo in the container). */
   root: string;
-  /** The planning prompt to send to Claude. */
-  prompt: string;
+  /** A one-shot prompt, or a stream of user messages for multi-turn sessions. */
+  prompt: string | AsyncIterable<SDKUserMessage>;
+  /** Permission mode for the session. Defaults to "plan". */
+  permissionMode?: PermissionMode;
   /** Called with the plan content whenever a plan file is finalized. */
   onPlan?: (content: string, filename: string) => void;
   /** Called for every VFS IPC message (vfs_write, plan_file_write, ...). */
   onVfsMessage?: (msg: VfsMessage) => void;
-  /** Permission callback — lets the host answer AskUserQuestion / ExitPlanMode. */
+  /** Permission callback — lets the host answer tool permission requests. */
   canUseTool?: CanUseTool;
   /** Abort controller for cancelling the session. */
   abortController?: AbortController;
@@ -70,7 +79,7 @@ export function planBakedRepo(options: BakedPlanOptions): BakedPlanSession {
     prompt: options.prompt,
     options: {
       env: { ...buildChildEnv(), ...options.extraEnv },
-      permissionMode: "plan",
+      permissionMode: options.permissionMode ?? "plan",
       executable: "bun",
       cwd: options.root,
       canUseTool: options.canUseTool,

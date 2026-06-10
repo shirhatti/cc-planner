@@ -1,28 +1,59 @@
 /**
  * <cc-app> — root component. Owns the WebSocket connection (one socket,
  * multiplexing many sessions), the session records (persisted to
- * localStorage via store.js), and the per-session live feed elements.
+ * localStorage), and the per-session live feed elements.
  */
 
-import { deleteSession, loadSessions, loadSettings, newId, saveSession } from "./store.js";
-import "./components/cc-session-list.js";
-import "./components/cc-start-form.js";
-import "./components/cc-feed.js";
-import "./components/cc-plan-panel.js";
-import "./components/cc-settings-panel.js";
-import "./components/cc-stats-panel.js";
+import type { ClientMessage, ConfigMessage, ServerMessage } from "../../lib/protocol";
+import {
+  deleteSession,
+  loadSessions,
+  loadSettings,
+  newId,
+  saveSession,
+  type SessionRecord,
+} from "../store";
+import "./cc-composer";
+import "./cc-feed";
+import "./cc-plan-panel";
+import "./cc-question-card";
+import "./cc-session-list";
+import "./cc-settings-panel";
+import "./cc-start-form";
+import "./cc-stats-panel";
+import type { AnswerQuestionDetail } from "./cc-question-card";
+import type { CcFeed, PermissionDecisionDetail } from "./cc-feed";
+import type { PlanDecisionDetail } from "./cc-plan-panel";
+import type { StartSessionDetail } from "./cc-start-form";
+
+const FINISHED = ["approved", "done", "stopped", "error"];
 
 export class CcApp extends HTMLElement {
-  connectedCallback() {
+  private badge!: HTMLElement;
+  private statusEl!: HTMLElement;
+  private sessionList!: HTMLElementTagNameMap["cc-session-list"];
+  private startForm!: HTMLElementTagNameMap["cc-start-form"];
+  private composer!: HTMLElementTagNameMap["cc-composer"];
+  private feeds!: HTMLElement;
+  private planPanel!: HTMLElementTagNameMap["cc-plan-panel"];
+  private statsPanel!: HTMLElementTagNameMap["cc-stats-panel"];
+
+  private ws?: WebSocket;
+  private config: ConfigMessage = { type: "config", mode: "lazy" };
+  private records = new Map<string, SessionRecord>();
+  private liveFeeds = new Map<string, CcFeed>();
+  private activeId: string | null = null;
+
+  connectedCallback(): void {
     this.innerHTML = `
       <header>
-        <h1>cc-planner</h1>
+        <h1>claude · web tty</h1>
         <span class="badge mode-badge">connecting…</span>
         <span class="status"></span>
       </header>
       <div class="layout">
         <aside>
-          <button class="new-session">＋ New plan</button>
+          <button class="new-session">＋ New session</button>
           <cc-session-list></cc-session-list>
           <cc-settings-panel></cc-settings-panel>
         </aside>
@@ -30,6 +61,7 @@ export class CcApp extends HTMLElement {
           <section class="left">
             <cc-start-form></cc-start-form>
             <div class="feeds"></div>
+            <cc-composer hidden></cc-composer>
           </section>
           <section class="right">
             <cc-plan-panel></cc-plan-panel>
@@ -38,39 +70,51 @@ export class CcApp extends HTMLElement {
         </main>
       </div>`;
 
-    this.badge = this.querySelector(".mode-badge");
-    this.statusEl = this.querySelector(".status");
-    this.sessionList = this.querySelector("cc-session-list");
-    this.startForm = this.querySelector("cc-start-form");
-    this.feeds = this.querySelector(".feeds");
-    this.planPanel = this.querySelector("cc-plan-panel");
-    this.statsPanel = this.querySelector("cc-stats-panel");
+    this.badge = this.querySelector(".mode-badge")!;
+    this.statusEl = this.querySelector(".status")!;
+    this.sessionList = this.querySelector("cc-session-list")!;
+    this.startForm = this.querySelector("cc-start-form")!;
+    this.composer = this.querySelector("cc-composer")!;
+    this.feeds = this.querySelector(".feeds")!;
+    this.planPanel = this.querySelector("cc-plan-panel")!;
+    this.statsPanel = this.querySelector("cc-stats-panel")!;
 
-    this.config = { mode: "lazy" };
-    /** @type {Map<string, object>} session id -> record */
     this.records = new Map(loadSessions().map((s) => [s.id, s]));
-    /** @type {Map<string, HTMLElement>} session id -> live <cc-feed> */
-    this.liveFeeds = new Map();
-    this.activeId = null;
 
-    this.querySelector(".new-session").onclick = () => this.newDraft();
-    this.addEventListener("select-session", (ev) => this.setActive(ev.detail.id));
-    this.addEventListener("delete-session", (ev) => this.deleteSession(ev.detail.id));
-    this.addEventListener("start-session", (ev) => this.startSession(ev.detail));
-    this.addEventListener("interrupt-session", () => this.interruptActive());
-    this.addEventListener("answer-question", (ev) => {
-      const sessionId = ev.target.closest("cc-feed")?.dataset.sessionId;
+    this.querySelector<HTMLButtonElement>(".new-session")!.onclick = () => this.newDraft();
+    this.addEventListener("select-session", ((ev: CustomEvent<{ id: string }>) =>
+      this.setActive(ev.detail.id)) as EventListener);
+    this.addEventListener("delete-session", ((ev: CustomEvent<{ id: string }>) =>
+      this.deleteSession(ev.detail.id)) as EventListener);
+    this.addEventListener("start-session", ((ev: CustomEvent<StartSessionDetail>) =>
+      this.startSession(ev.detail)) as EventListener);
+    this.addEventListener("send-message", ((ev: CustomEvent<{ text: string }>) =>
+      this.sendUserMessage(ev.detail.text)) as EventListener);
+    this.addEventListener("stop-turn", (() => {
+      if (this.activeId) this.sendMsg({ type: "interrupt", sessionId: this.activeId });
+    }) as EventListener);
+    this.addEventListener("end-session", (() => {
+      if (this.activeId) this.sendMsg({ type: "end_session", sessionId: this.activeId });
+    }) as EventListener);
+    this.addEventListener("answer-question", ((ev: CustomEvent<AnswerQuestionDetail>) => {
+      const sessionId = (ev.target as HTMLElement).closest("cc-feed")?.dataset.sessionId;
       if (!sessionId) return;
       this.sendMsg({ type: "answer_question", sessionId, ...ev.detail });
       this.updateStatus(sessionId, "running");
-    });
-    this.addEventListener("plan-decision", (ev) => {
+    }) as EventListener);
+    this.addEventListener("permission-decision", ((ev: CustomEvent<PermissionDecisionDetail>) => {
+      const sessionId = (ev.target as HTMLElement).closest("cc-feed")?.dataset.sessionId;
+      if (!sessionId) return;
+      this.sendMsg({ type: "permission_decision", sessionId, ...ev.detail });
+      this.updateStatus(sessionId, "running");
+    }) as EventListener);
+    this.addEventListener("plan-decision", ((ev: CustomEvent<PlanDecisionDetail>) => {
       const sessionId = this.planPanel.dataset.sessionId;
-      const record = this.records.get(sessionId);
+      const record = sessionId ? this.records.get(sessionId) : undefined;
       if (!sessionId || !record) return;
       record.pendingReview = null;
       this.sendMsg({ type: "plan_decision", sessionId, ...ev.detail });
-    });
+    }) as EventListener);
 
     this.newDraft();
     this.connect();
@@ -78,15 +122,15 @@ export class CcApp extends HTMLElement {
 
   // -- WebSocket ------------------------------------------------------------
 
-  connect() {
+  private connect(): void {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     this.ws = new WebSocket(`${proto}://${location.host}/ws`);
-    this.ws.onmessage = (ev) => this.handleServerMessage(JSON.parse(ev.data));
+    this.ws.onmessage = (ev) => this.handleServerMessage(JSON.parse(String(ev.data)));
     this.ws.onclose = () => {
       // Server-side sessions die with the socket.
       for (const id of this.liveFeeds.keys()) {
         const record = this.records.get(id);
-        if (record && record.status !== "draft" && !this.isFinished(record)) {
+        if (record && record.status !== "draft" && !FINISHED.includes(record.status)) {
           this.updateStatus(id, "stopped");
         }
       }
@@ -95,7 +139,7 @@ export class CcApp extends HTMLElement {
     };
   }
 
-  sendMsg(msg) {
+  private sendMsg(msg: ClientMessage): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
     }
@@ -103,13 +147,15 @@ export class CcApp extends HTMLElement {
 
   // -- session lifecycle ------------------------------------------------------
 
-  newDraft() {
-    const record = {
+  private newDraft(): void {
+    const record: SessionRecord = {
       id: newId(),
       status: "draft",
       prompt: "",
       repo: "",
       branch: "",
+      mode: "plan",
+      stopOnPlanApproval: true,
       plan: "",
       planFilename: "",
       createdAt: Date.now(),
@@ -118,8 +164,8 @@ export class CcApp extends HTMLElement {
     this.setActive(record.id);
   }
 
-  startSession({ repo, branch, prompt }) {
-    const record = this.records.get(this.activeId);
+  private startSession(detail: StartSessionDetail): void {
+    const record = this.activeId ? this.records.get(this.activeId) : undefined;
     if (!record || record.status !== "draft") return;
     if (this.ws?.readyState !== WebSocket.OPEN) {
       this.statusEl.textContent = "not connected — try again";
@@ -127,10 +173,12 @@ export class CcApp extends HTMLElement {
     }
 
     Object.assign(record, {
-      repo: this.config.mode === "baked" ? this.config.repo : repo,
-      branch,
-      prompt,
-      status: "starting",
+      repo: this.config.mode === "baked" ? (this.config.repo ?? "") : detail.repo,
+      branch: detail.branch,
+      prompt: detail.prompt,
+      mode: detail.mode,
+      stopOnPlanApproval: detail.stopOnPlanApproval,
+      status: "starting" as const,
       createdAt: Date.now(),
       startedAt: Date.now(),
     });
@@ -139,14 +187,17 @@ export class CcApp extends HTMLElement {
     feed.dataset.sessionId = record.id;
     this.feeds.append(feed);
     this.liveFeeds.set(record.id, feed);
+    feed.addUserMessage(detail.prompt);
 
     const settings = loadSettings();
     this.sendMsg({
       type: "start",
       sessionId: record.id,
-      prompt,
-      repo: repo || undefined,
-      branch: branch || undefined,
+      prompt: detail.prompt,
+      repo: detail.repo || undefined,
+      branch: detail.branch || undefined,
+      mode: detail.mode,
+      stopOnPlanApproval: detail.stopOnPlanApproval,
       auth:
         settings.baseUrl || settings.authToken
           ? { baseUrl: settings.baseUrl, authToken: settings.authToken }
@@ -157,17 +208,19 @@ export class CcApp extends HTMLElement {
     this.setActive(record.id);
   }
 
-  interruptActive() {
-    const record = this.records.get(this.activeId);
-    if (!record) return;
-    this.sendMsg({ type: "interrupt", sessionId: record.id });
-    this.updateStatus(record.id, "stopped");
+  private sendUserMessage(text: string): void {
+    const record = this.activeId ? this.records.get(this.activeId) : undefined;
+    if (!record || !this.liveFeeds.has(record.id)) return;
+    this.sendMsg({ type: "user_message", sessionId: record.id, text });
+    this.liveFeeds.get(record.id)?.addUserMessage(text);
+    this.updateStatus(record.id, "running");
   }
 
-  deleteSession(id) {
+  private deleteSession(id: string): void {
     if (this.liveFeeds.has(id)) {
       this.sendMsg({ type: "interrupt", sessionId: id });
-      this.liveFeeds.get(id).remove();
+      this.sendMsg({ type: "end_session", sessionId: id });
+      this.liveFeeds.get(id)?.remove();
       this.liveFeeds.delete(id);
     }
     this.records.delete(id);
@@ -183,15 +236,15 @@ export class CcApp extends HTMLElement {
 
   // -- server events ----------------------------------------------------------
 
-  handleServerMessage(msg) {
+  private handleServerMessage(msg: ServerMessage): void {
     if (msg.type === "config") {
       this.config = msg;
       this.badge.textContent =
         msg.mode === "baked"
           ? `baked: ${msg.repo}${msg.ref ? " @ " + msg.ref.slice(0, 8) : ""}`
           : "lazy hydration";
-      this.startForm.setMode(msg.mode);
-      this.startForm.showSession(this.records.get(this.activeId));
+      this.startForm.setWorkspaceMode(msg.mode);
+      this.startForm.showSession(this.activeId ? this.records.get(this.activeId) : undefined);
       return;
     }
 
@@ -205,7 +258,7 @@ export class CcApp extends HTMLElement {
         record.repo = msg.repo;
         record.ref = msg.ref;
         this.updateStatus(msg.sessionId, "running");
-        feed.addInfo(`Planning against ${msg.repo} @ ${msg.ref.slice(0, 12)}`);
+        feed.addInfo(`Workspace ready: ${msg.repo} @ ${msg.ref.slice(0, 12)}`);
         break;
       case "session_init":
         record.model = msg.model;
@@ -215,7 +268,7 @@ export class CcApp extends HTMLElement {
         feed.addAssistant(msg.text);
         break;
       case "tool_activity":
-        feed.addTool(msg.name, msg.detail);
+        feed.addTool(msg.name, msg.detail, msg.diff);
         break;
       case "hydrate_init":
         feed.addInfo(`Repo manifest ready: ${msg.files} files (contents fetched on demand)`);
@@ -233,6 +286,10 @@ export class CcApp extends HTMLElement {
         this.updateStatus(msg.sessionId, "awaiting-input");
         feed.addQuestion(msg.id, msg.questions);
         break;
+      case "permission_request":
+        this.updateStatus(msg.sessionId, "awaiting-input");
+        feed.addPermission(msg.id, msg.toolName, msg.detail, msg.diff);
+        break;
       case "plan_review":
         record.pendingReview = { id: msg.id, allowedPrompts: msg.allowedPrompts };
         this.updateStatus(msg.sessionId, "reviewing");
@@ -243,7 +300,10 @@ export class CcApp extends HTMLElement {
         feed.addInfo(
           msg.approved ? "Plan approved ✔" : "Changes requested — Claude is revising the plan",
         );
-        this.updateStatus(msg.sessionId, msg.approved ? "approved" : "running");
+        this.updateStatus(
+          msg.sessionId,
+          msg.approved && record.stopOnPlanApproval ? "approved" : "running",
+        );
         break;
       case "session_stats":
         record.stats = msg.stats;
@@ -253,14 +313,15 @@ export class CcApp extends HTMLElement {
       case "result": {
         if (msg.result) feed.addAssistant(msg.result);
         const costNote = msg.costUsd != null ? `, ~$${msg.costUsd.toFixed(4)} est.` : "";
-        feed.addInfo(`Session finished (${(msg.durationMs / 1000).toFixed(1)}s${costNote})`);
+        feed.addInfo(`Turn finished (${((msg.durationMs ?? 0) / 1000).toFixed(1)}s${costNote})`);
         record.costUsd = msg.costUsd;
+        if (!FINISHED.includes(record.status)) this.updateStatus(msg.sessionId, "idle");
         break;
       }
       case "session_done":
-        if (!this.isFinished(record)) this.updateStatus(msg.sessionId, "done");
+        if (!FINISHED.includes(record.status)) this.updateStatus(msg.sessionId, "done");
         this.persist(record);
-        if (isActive) this.startForm.showSession(record);
+        if (isActive) this.refreshActiveChrome(record);
         break;
       case "error":
         feed.addError(msg.message);
@@ -271,43 +332,42 @@ export class CcApp extends HTMLElement {
 
   // -- rendering helpers --------------------------------------------------------
 
-  isFinished(record) {
-    return ["approved", "done", "stopped", "error"].includes(record.status);
-  }
-
-  orderedRecords() {
+  private orderedRecords(): SessionRecord[] {
     return [...this.records.values()].sort((a, b) => b.createdAt - a.createdAt);
   }
 
-  persist(record) {
+  private persist(record: SessionRecord): void {
     if (record.status !== "draft") saveSession(record);
   }
 
-  updateStatus(id, status) {
+  private updateStatus(id: string, status: SessionRecord["status"]): void {
     const record = this.records.get(id);
-    if (!record || (record.status === "approved" && status === "done")) return;
-    if (this.isFinished(record) && status === "done") return;
+    if (!record) return;
+    if (FINISHED.includes(record.status) && !FINISHED.includes(status)) return;
     record.status = status;
     this.persist(record);
     this.renderList();
-    if (id === this.activeId) {
-      this.statusEl.textContent = status;
-      this.startForm.showSession(record);
-    }
+    if (id === this.activeId) this.refreshActiveChrome(record);
   }
 
-  renderList() {
+  private refreshActiveChrome(record: SessionRecord): void {
+    this.statusEl.textContent = record.status === "draft" ? "" : record.status;
+    this.startForm.showSession(record);
+    this.composer.hidden = !this.liveFeeds.has(record.id) || FINISHED.includes(record.status);
+  }
+
+  private renderList(): void {
     this.sessionList.update(this.orderedRecords(), this.activeId);
   }
 
-  setActive(id) {
+  private setActive(id: string): void {
     this.activeId = id;
     const record = this.records.get(id);
 
     for (const [feedId, feed] of this.liveFeeds) {
       feed.style.display = feedId === id ? "" : "none";
     }
-    let note = this.feeds.querySelector(".restored-note");
+    let note = this.feeds.querySelector<HTMLElement>(".restored-note");
     if (!this.liveFeeds.has(id) && record?.status !== "draft") {
       if (!note) {
         note = document.createElement("div");
@@ -323,10 +383,15 @@ export class CcApp extends HTMLElement {
     this.planPanel.dataset.sessionId = id;
     this.planPanel.showSession(record);
     this.statsPanel.showSession(record);
-    this.startForm.showSession(record);
-    this.statusEl.textContent = record?.status === "draft" ? "" : (record?.status ?? "");
+    if (record) this.refreshActiveChrome(record);
     this.renderList();
   }
 }
 
 customElements.define("cc-app", CcApp);
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "cc-app": CcApp;
+  }
+}

@@ -3,7 +3,7 @@
  * markup is generated, so untrusted model output can't inject HTML.
  */
 
-export function escapeHtml(s) {
+export function escapeHtml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -11,7 +11,7 @@ export function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
-function inlineMd(s) {
+function inlineMd(s: string): string {
   return s
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
@@ -22,13 +22,13 @@ function inlineMd(s) {
     );
 }
 
-export function renderMarkdown(md) {
+export function renderMarkdown(md: string): string {
   const lines = escapeHtml(md).split("\n");
-  const out = [];
+  const out: string[] = [];
   let inCode = false;
-  let listTag = null;
+  let listTag: "ul" | "ol" | null = null;
 
-  const closeList = () => {
+  const closeList = (): void => {
     if (listTag) {
       out.push(`</${listTag}>`);
       listTag = null;
@@ -62,7 +62,7 @@ export function renderMarkdown(md) {
         out.push(`<${tag}>`);
         listTag = tag;
       }
-      out.push(`<li>${inlineMd((bullet || ordered)[1])}</li>`);
+      out.push(`<li>${inlineMd((bullet || ordered)![1])}</li>`);
     } else if (/^\s*(---|\*\*\*)\s*$/.test(line)) {
       closeList();
       out.push("<hr>");

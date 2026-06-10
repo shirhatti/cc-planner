@@ -12,7 +12,7 @@ import { estimateModelCostUsd, priceForModel } from "./lib/pricing";
 import type { SessionEvent } from "./lib/protocol";
 import {
   gatewayEnv,
-  PlanSession,
+  ClaudeSession,
   resolveRepoMode,
   summarizeToolInput,
   type RunnerResult,
@@ -116,7 +116,7 @@ describe("pricing", () => {
   });
 });
 
-describe("PlanSession", () => {
+describe("ClaudeSession", () => {
   test("AskUserQuestion round-trips answers from the browser", async () => {
     const results: PermissionResult[] = [];
     const sent: SessionEvent[] = [];
@@ -127,7 +127,7 @@ describe("PlanSession", () => {
       yield* [] as SDKMessage[];
     });
 
-    const session: PlanSession = new PlanSession((msg) => {
+    const session: ClaudeSession = new ClaudeSession((msg) => {
       sent.push(msg);
       if (msg.type === "ask_user_question") {
         expect(msg.id).toBe("tu_1");
@@ -170,7 +170,7 @@ describe("PlanSession", () => {
       return { session: gen, repo: "owner/repo", ref: "abc123def456" };
     };
 
-    const session: PlanSession = new PlanSession((msg) => {
+    const session: ClaudeSession = new ClaudeSession((msg) => {
       sent.push(msg);
       if (msg.type === "plan_review") {
         session.handleClientMessage({
@@ -197,7 +197,7 @@ describe("PlanSession", () => {
       yield* [] as SDKMessage[];
     });
 
-    const session: PlanSession = new PlanSession((msg) => {
+    const session: ClaudeSession = new ClaudeSession((msg) => {
       if (msg.type === "plan_review") {
         session.handleClientMessage({
           type: "plan_decision",
@@ -224,7 +224,7 @@ describe("PlanSession", () => {
       yield* [] as SDKMessage[];
     });
 
-    const session: PlanSession = new PlanSession((msg) => {
+    const session: ClaudeSession = new ClaudeSession((msg) => {
       sent.push(msg);
       if (msg.type === "plan_review") {
         session.handleClientMessage({
@@ -255,15 +255,134 @@ describe("PlanSession", () => {
     });
   });
 
-  test("other tools are allowed without a browser round-trip", async () => {
+  test("plan approval without stopOnPlanApproval lets the session continue", async () => {
     const results: PermissionResult[] = [];
+    const sent: SessionEvent[] = [];
+    let interrupted = false;
+
+    const runner: SessionRunner = (args) => {
+      const gen = (async function* () {
+        results.push(
+          await args.canUseTool("ExitPlanMode", { allowedPrompts: [] }, toolOptions("tu_c")),
+        );
+        yield* [] as SDKMessage[];
+      })() as RunnerResult["session"];
+      gen.interrupt = async () => {
+        interrupted = true;
+      };
+      return { session: gen, repo: "owner/repo", ref: "abc123def456" };
+    };
+
+    const session: ClaudeSession = new ClaudeSession((msg) => {
+      sent.push(msg);
+      if (msg.type === "plan_review") {
+        session.handleClientMessage({
+          type: "plan_decision",
+          sessionId: "s1",
+          id: msg.id,
+          approved: true,
+        });
+        session.handleClientMessage({ type: "end_session", sessionId: "s1" });
+      }
+    }, runner);
+
+    await session.start({ prompt: "p", mode: "plan", stopOnPlanApproval: false });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    expect(results[0]?.behavior).toBe("allow");
+    expect(interrupted).toBe(false);
+    expect(sent.some((m) => m.type === "plan_decided" && m.approved)).toBe(true);
+  });
+
+  test("gated tools become browser permission requests", async () => {
+    const results: PermissionResult[] = [];
+    const sent: SessionEvent[] = [];
     const runner = fakeRunner(async function* (args) {
-      results.push(await args.canUseTool("Read", { file_path: "/x" }, toolOptions("tu_4")));
+      results.push(await args.canUseTool("Bash", { command: "bun test" }, toolOptions("tu_a")));
+      results.push(
+        await args.canUseTool(
+          "Edit",
+          { file_path: "/src/a.ts", old_string: "foo", new_string: "bar" },
+          toolOptions("tu_b"),
+        ),
+      );
+      results.push(await args.canUseTool("Bash", { command: "rm -rf /" }, toolOptions("tu_d")));
       yield* [] as SDKMessage[];
     });
-    const session = new PlanSession(() => {}, runner);
-    await session.start({ prompt: "p" });
-    expect(results[0]).toEqual({ behavior: "allow", updatedInput: { file_path: "/x" } });
+
+    const session: ClaudeSession = new ClaudeSession((msg) => {
+      sent.push(msg);
+      if (msg.type !== "permission_request") return;
+      if (msg.id === "tu_a") {
+        session.handleClientMessage({
+          type: "permission_decision",
+          sessionId: "s1",
+          id: msg.id,
+          allow: true,
+        });
+      } else if (msg.id === "tu_b") {
+        // Edit permission requests carry a reviewable diff.
+        expect(msg.diff).toEqual({ filePath: "/src/a.ts", oldText: "foo", newText: "bar" });
+        session.handleClientMessage({
+          type: "permission_decision",
+          sessionId: "s1",
+          id: msg.id,
+          allow: true,
+          always: true,
+        });
+      } else {
+        session.handleClientMessage({
+          type: "permission_decision",
+          sessionId: "s1",
+          id: msg.id,
+          allow: false,
+        });
+      }
+    }, runner);
+
+    await session.start({ prompt: "p", mode: "default" });
+
+    expect(results[0]).toEqual({
+      behavior: "allow",
+      updatedInput: { command: "bun test" },
+      updatedPermissions: undefined,
+    });
+    expect(results[1]).toEqual({
+      behavior: "allow",
+      updatedInput: { file_path: "/src/a.ts", old_string: "foo", new_string: "bar" },
+      updatedPermissions: [
+        {
+          type: "addRules",
+          rules: [{ toolName: "Edit" }],
+          behavior: "allow",
+          destination: "session",
+        },
+      ],
+    });
+    expect(results[2]).toEqual({ behavior: "deny", message: "The user denied this tool call." });
+  });
+
+  test("user messages stream into the session until end_session", async () => {
+    const received: string[] = [];
+    const runner: SessionRunner = (args) => {
+      const gen = (async function* () {
+        const prompt = args.prompt as AsyncIterable<{ message: { content: unknown } }>;
+        for await (const userMsg of prompt) {
+          const content = userMsg.message.content as { type: string; text: string }[];
+          received.push(content[0].text);
+        }
+        yield* [] as SDKMessage[];
+      })() as RunnerResult["session"];
+      return { session: gen, repo: "owner/repo", ref: "abc123def456" };
+    };
+
+    const session = new ClaudeSession(() => {}, runner);
+    const done = session.start({ prompt: "first" });
+    session.handleClientMessage({ type: "user_message", sessionId: "s1", text: "second" });
+    session.handleClientMessage({ type: "end_session", sessionId: "s1" });
+    await done;
+
+    expect(received).toEqual(["first", "second"]);
   });
 
   test("forwards SDK and VFS events to the browser", async () => {
@@ -290,7 +409,7 @@ describe("PlanSession", () => {
       } as unknown as SDKMessage;
     });
 
-    const session = new PlanSession((msg) => sent.push(msg), runner);
+    const session = new ClaudeSession((msg) => sent.push(msg), runner);
     await session.start({ prompt: "p" });
 
     expect(sent).toContainEqual({
@@ -329,7 +448,7 @@ describe("PlanSession", () => {
       yield* [] as SDKMessage[];
     });
 
-    const session: PlanSession = new PlanSession((msg) => {
+    const session: ClaudeSession = new ClaudeSession((msg) => {
       sent.push(msg);
       if (msg.type === "ask_user_question") {
         session.dispose();
@@ -379,7 +498,7 @@ describe("PlanSession", () => {
       } as unknown as SDKMessage;
     });
 
-    const session = new PlanSession((msg) => sent.push(msg), runner);
+    const session = new ClaudeSession((msg) => sent.push(msg), runner);
     await session.start({ prompt: "p" });
 
     const statsEvents = sent.filter(
@@ -454,7 +573,7 @@ describe("PlanSession", () => {
         } as unknown as SDKMessage;
       }
     });
-    const session = new PlanSession((msg) => sent.push(msg), runner);
+    const session = new ClaudeSession((msg) => sent.push(msg), runner);
     await session.start({ prompt: "p" });
 
     const last = sent
@@ -478,7 +597,7 @@ describe("PlanSession", () => {
       seenEnv = args.extraEnv;
       yield* [];
     });
-    const session = new PlanSession(() => {}, runner);
+    const session = new ClaudeSession(() => {}, runner);
     await session.start({
       prompt: "p",
       auth: { baseUrl: "https://gw.example.com", authToken: "tok" },

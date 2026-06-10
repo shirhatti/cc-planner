@@ -1,33 +1,35 @@
 /**
  * <cc-stats-panel> — session statistics: duration (ticking live), token
- * counts by type and per model, cost, and hydration volume. Updates from
- * streamed session_stats events; the final event carries the SDK's
- * authoritative totals.
+ * counts by type and per model, estimated cost (public token pricing), and
+ * hydration volume.
  */
 
-const LIVE_STATUSES = ["starting", "running", "awaiting-input", "reviewing"];
+import { LIVE_STATUSES, type SessionRecord } from "../store";
 
-export function formatTokens(n) {
+export function formatTokens(n: number | null | undefined): string {
   if (n == null) return "0";
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
   return String(n);
 }
 
-export function formatBytes(n) {
+export function formatBytes(n: number): string {
   if (!n) return "0 B";
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)} kB`;
   return `${n} B`;
 }
 
-export function formatDuration(ms) {
+export function formatDuration(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
   return s >= 60 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s` : `${s}s`;
 }
 
 export class CcStatsPanel extends HTMLElement {
-  connectedCallback() {
+  private record: SessionRecord | null = null;
+  private ticker?: ReturnType<typeof setInterval>;
+
+  connectedCallback(): void {
     this.innerHTML = `
       <details class="stats-panel">
         <summary>
@@ -43,32 +45,32 @@ export class CcStatsPanel extends HTMLElement {
         </table>
       </details>`;
     this.hidden = true;
-    this.record = null;
     this.ticker = setInterval(() => this.tick(), 1000);
   }
 
-  disconnectedCallback() {
+  disconnectedCallback(): void {
     clearInterval(this.ticker);
   }
 
-  showSession(record) {
-    this.record = record;
+  showSession(record: SessionRecord | undefined): void {
+    this.record = record ?? null;
     this.render();
   }
 
   /** Keep the duration ticking for a live session between stats events. */
-  tick() {
-    if (!this.record?.startedAt || !LIVE_STATUSES.includes(this.record.status)) return;
-    if (this.record.stats?.final) return;
+  private tick(): void {
+    const record = this.record;
+    if (!record?.startedAt || !LIVE_STATUSES.includes(record.status)) return;
+    if (record.stats?.final) return;
     this.querySelector(".stat-duration")?.replaceChildren(
-      formatDuration(Date.now() - this.record.startedAt),
+      formatDuration(Date.now() - record.startedAt),
     );
   }
 
-  render() {
+  private render(): void {
     const record = this.record;
     const stats = record?.stats;
-    if (!stats) {
+    if (!record || !stats) {
       this.hidden = true;
       return;
     }
@@ -77,32 +79,39 @@ export class CcStatsPanel extends HTMLElement {
     const live = !stats.final && LIVE_STATUSES.includes(record.status);
     const durationMs = live && record.startedAt ? Date.now() - record.startedAt : stats.durationMs;
 
-    const cost = (value) => `${stats.estimated ? "~" : ""}$${value.toFixed(4)}`;
+    const cost = (value: number): string => `${stats.estimated ? "~" : ""}$${value.toFixed(4)}`;
     const summary = [
       formatDuration(durationMs),
       `${formatTokens(stats.totals.inputTokens + stats.totals.outputTokens)} tokens`,
     ];
     if (stats.costUsd != null) summary.push(cost(stats.costUsd));
     if (!stats.final) summary.push("live");
-    this.querySelector(".stats-summary").textContent = summary.join(" · ");
+    this.querySelector(".stats-summary")!.textContent = summary.join(" · ");
 
-    const cells = [
+    const cells: [string, string, string?][] = [
       ["Duration", formatDuration(durationMs), "stat-duration"],
-      ...(stats.apiDurationMs != null ? [["API time", formatDuration(stats.apiDurationMs)]] : []),
-      ...(stats.numTurns != null ? [["Turns", String(stats.numTurns)]] : []),
+      ...(stats.apiDurationMs != null
+        ? ([["API time", formatDuration(stats.apiDurationMs)]] as [string, string][])
+        : []),
+      ...(stats.numTurns != null
+        ? ([["Turns", String(stats.numTurns)]] as [string, string][])
+        : []),
       ...(stats.costUsd != null
-        ? [[stats.estimated ? "Cost (est.)" : "Cost", cost(stats.costUsd)]]
+        ? ([[stats.estimated ? "Cost (est.)" : "Cost", cost(stats.costUsd)]] as [string, string][])
         : []),
       ["Input", formatTokens(stats.totals.inputTokens)],
       ["Output", formatTokens(stats.totals.outputTokens)],
       ["Cache read", formatTokens(stats.totals.cacheReadTokens)],
       ["Cache write", formatTokens(stats.totals.cacheCreationTokens)],
       ...(stats.filesHydrated
-        ? [["Files hydrated", `${stats.filesHydrated} (${formatBytes(stats.bytesFetched)})`]]
+        ? ([["Files hydrated", `${stats.filesHydrated} (${formatBytes(stats.bytesFetched)})`]] as [
+            string,
+            string,
+          ][])
         : []),
     ];
 
-    const grid = this.querySelector(".stats-grid");
+    const grid = this.querySelector(".stats-grid")!;
     grid.innerHTML = "";
     for (const [label, value, cls] of cells) {
       const cell = document.createElement("div");
@@ -118,9 +127,9 @@ export class CcStatsPanel extends HTMLElement {
     }
 
     const models = Object.entries(stats.byModel);
-    const table = this.querySelector(".stats-models");
+    const table = this.querySelector<HTMLTableElement>(".stats-models")!;
     table.hidden = models.length === 0;
-    const tbody = table.querySelector("tbody");
+    const tbody = table.querySelector("tbody")!;
     tbody.innerHTML = "";
     for (const [model, usage] of models) {
       const row = document.createElement("tr");
@@ -143,3 +152,9 @@ export class CcStatsPanel extends HTMLElement {
 }
 
 customElements.define("cc-stats-panel", CcStatsPanel);
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "cc-stats-panel": CcStatsPanel;
+  }
+}

@@ -7,11 +7,13 @@
   "type": "module",
   "scripts": {
     "start": "bun run web/server.ts",
+    "dev:ui": "vite",
+    "build": "vite build",
     "test": "bun test",
-    "lint": "eslint preload/ scripts/ web/",
-    "lint:fix": "eslint --fix preload/ scripts/ web/",
-    "format": "prettier --write preload/ scripts/ web/",
-    "format:check": "prettier --check preload/ scripts/ web/",
+    "lint": "eslint preload/ scripts/ web/ vite.config.ts",
+    "lint:fix": "eslint --fix preload/ scripts/ web/ vite.config.ts",
+    "format": "prettier --write preload/ scripts/ web/ vite.config.ts",
+    "format:check": "prettier --check preload/ scripts/ web/ vite.config.ts",
     "prepare": "husky"
   },
   "lint-staged": {
@@ -24,7 +26,8 @@
     ]
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.42"
+    "@anthropic-ai/claude-agent-sdk": "^0.2.42",
+    "@pierre/diffs": "^1.2.9"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -37,6 +40,8 @@
     "lint-staged": "^16.2.7",
     "prettier": "^3.8.1",
     "typescript": "^5.7.2",
-    "typescript-eslint": "^8.55.0"
+    "typescript-eslint": "^8.55.0",
+    "vite": "^8.0.16",
+    "vite-plugin-pwa": "^1.3.0"
   }
 }

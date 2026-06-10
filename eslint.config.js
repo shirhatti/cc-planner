@@ -9,31 +9,12 @@ export default tseslint.config(
   eslintConfigPrettier,
   eslintPluginPrettier,
   {
-    ignores: ["node_modules/", ".next/", "tsconfig.tsbuildinfo"],
+    ignores: ["node_modules/", "web/dist/", "tsconfig.tsbuildinfo"],
   },
   {
     files: ["preload/**/*.ts"],
     rules: {
       "@typescript-eslint/no-require-imports": "off",
-    },
-  },
-  {
-    files: ["web/public/**/*.js"],
-    languageOptions: {
-      globals: {
-        document: "readonly",
-        window: "readonly",
-        location: "readonly",
-        localStorage: "readonly",
-        WebSocket: "readonly",
-        HTMLElement: "readonly",
-        CustomEvent: "readonly",
-        customElements: "readonly",
-        crypto: "readonly",
-        setTimeout: "readonly",
-        setInterval: "readonly",
-        clearInterval: "readonly",
-      },
     },
   },
 );

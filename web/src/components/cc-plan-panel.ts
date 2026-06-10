@@ -4,16 +4,29 @@
  * { id, approved, feedback }.
  */
 
-import { renderMarkdown } from "../markdown.js";
+import { renderMarkdown } from "../markdown";
+import type { PendingReview, SessionRecord } from "../store";
+
+export interface PlanDecisionDetail {
+  id: string;
+  approved: boolean;
+  feedback: string;
+}
 
 export class CcPlanPanel extends HTMLElement {
-  connectedCallback() {
+  private body!: HTMLElement;
+  private empty!: HTMLElement;
+  private filename!: HTMLElement;
+  private review!: HTMLElement;
+  private reviewId: string | null = null;
+
+  connectedCallback(): void {
     this.innerHTML = `
       <div class="plan-header">
         <h2>Plan</h2>
         <span class="plan-filename muted"></span>
       </div>
-      <div class="plan-empty muted">The plan will stream here as Claude writes it.</div>
+      <div class="plan-empty muted">The plan will stream here when Claude writes one.</div>
       <article class="plan-body"></article>
       <div class="plan-review" hidden>
         <div class="review-title">Claude is ready to finalize this plan.</div>
@@ -31,22 +44,21 @@ export class CcPlanPanel extends HTMLElement {
         </div>
       </div>`;
 
-    this.body = this.querySelector(".plan-body");
-    this.empty = this.querySelector(".plan-empty");
-    this.filename = this.querySelector(".plan-filename");
-    this.review = this.querySelector(".plan-review");
-    this.reviewId = null;
+    this.body = this.querySelector(".plan-body")!;
+    this.empty = this.querySelector(".plan-empty")!;
+    this.filename = this.querySelector(".plan-filename")!;
+    this.review = this.querySelector(".plan-review")!;
 
-    this.querySelector(".approve").onclick = () => this.decide(true);
-    this.querySelector(".reject").onclick = () => this.decide(false);
+    this.querySelector<HTMLButtonElement>(".approve")!.onclick = () => this.decide(true);
+    this.querySelector<HTMLButtonElement>(".reject")!.onclick = () => this.decide(false);
   }
 
   /** Render plan + review state for the given session record. */
-  showSession(record) {
+  showSession(record: SessionRecord | undefined): void {
     const hasPlan = Boolean(record?.plan);
     this.empty.hidden = hasPlan;
-    this.filename.textContent = hasPlan ? (record.planFilename ?? "") : "";
-    this.body.innerHTML = hasPlan ? renderMarkdown(record.plan) : "";
+    this.filename.textContent = hasPlan ? (record?.planFilename ?? "") : "";
+    this.body.innerHTML = hasPlan ? renderMarkdown(record!.plan) : "";
     if (record?.pendingReview) {
       this.showReview(record.pendingReview);
     } else {
@@ -55,33 +67,41 @@ export class CcPlanPanel extends HTMLElement {
     }
   }
 
-  updatePlan(record) {
+  updatePlan(record: SessionRecord): void {
     this.empty.hidden = true;
     this.filename.textContent = record.planFilename ?? "";
     this.body.innerHTML = renderMarkdown(record.plan);
   }
 
-  showReview({ id, allowedPrompts }) {
+  showReview({ id, allowedPrompts }: PendingReview): void {
     this.reviewId = id;
-    this.querySelector(".review-note").hidden = this.body.innerHTML.trim() !== "";
-    this.querySelector(".allowed-prompts").textContent = allowedPrompts?.length
+    this.querySelector<HTMLElement>(".review-note")!.hidden = this.body.innerHTML.trim() !== "";
+    this.querySelector(".allowed-prompts")!.textContent = allowedPrompts?.length
       ? `Implementation would need permission to: ${allowedPrompts.map((p) => p.prompt).join("; ")}`
       : "";
-    this.querySelector(".review-feedback").value = "";
+    this.querySelector<HTMLTextAreaElement>(".review-feedback")!.value = "";
     this.review.hidden = false;
   }
 
-  decide(approved) {
+  private decide(approved: boolean): void {
     if (!this.reviewId) return;
-    const detail = {
+    const detail: PlanDecisionDetail = {
       id: this.reviewId,
       approved,
-      feedback: this.querySelector(".review-feedback").value,
+      feedback: this.querySelector<HTMLTextAreaElement>(".review-feedback")!.value,
     };
     this.review.hidden = true;
     this.reviewId = null;
-    this.dispatchEvent(new CustomEvent("plan-decision", { bubbles: true, detail }));
+    this.dispatchEvent(
+      new CustomEvent<PlanDecisionDetail>("plan-decision", { bubbles: true, detail }),
+    );
   }
 }
 
 customElements.define("cc-plan-panel", CcPlanPanel);
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "cc-plan-panel": CcPlanPanel;
+  }
+}

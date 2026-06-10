@@ -1,14 +1,14 @@
 /**
  * <cc-settings-panel> — gateway settings (Anthropic base URL + bearer
  * token), persisted in localStorage and applied to every newly started
- * session. Supports routing through an LLM gateway (e.g. LiteLLM, portkey)
- * instead of api.anthropic.com.
+ * session. Supports routing through an LLM gateway instead of
+ * api.anthropic.com.
  */
 
-import { loadSettings, saveSettings } from "../store.js";
+import { loadSettings, saveSettings } from "../store";
 
 export class CcSettingsPanel extends HTMLElement {
-  connectedCallback() {
+  connectedCallback(): void {
     const settings = loadSettings();
     this.innerHTML = `
       <details class="settings">
@@ -24,12 +24,12 @@ export class CcSettingsPanel extends HTMLElement {
         <div class="muted">Stored in this browser; sent with each new session. Leave empty to use the server's environment.</div>
       </details>`;
 
-    const baseUrl = this.querySelector(".base-url");
-    const authToken = this.querySelector(".auth-token");
+    const baseUrl = this.querySelector<HTMLInputElement>(".base-url")!;
+    const authToken = this.querySelector<HTMLInputElement>(".auth-token")!;
     baseUrl.value = settings.baseUrl ?? "";
     authToken.value = settings.authToken ?? "";
 
-    const persist = () =>
+    const persist = (): void =>
       saveSettings({ baseUrl: baseUrl.value.trim(), authToken: authToken.value.trim() });
     baseUrl.onchange = persist;
     authToken.onchange = persist;
@@ -37,3 +37,9 @@ export class CcSettingsPanel extends HTMLElement {
 }
 
 customElements.define("cc-settings-panel", CcSettingsPanel);
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "cc-settings-panel": CcSettingsPanel;
+  }
+}

@@ -1,8 +1,10 @@
 /**
- * cc-planner web app.
+ * Claude Code Web TTY — server.
  *
- * Serves a browser UI for running Claude Code plan-mode sessions against a
- * GitHub repo, on top of the VFS infra in this repo:
+ * A general browser client for Claude Code: multi-turn sessions, browser-side
+ * tool permissions (AskUserQuestion cards, plan review, allow/deny prompts
+ * with diffs), live plan streaming, and per-session stats. Built on the
+ * cc-planner VFS infra for its workspaces:
  *
  * - Lazy hydration (default): the repo is blob-less-cloned at session start
  *   and file contents are hydrated on demand (scripts/lib/plan-remote.ts).
@@ -10,34 +12,38 @@
  *   time (see Dockerfile); set CC_BAKED_REPO_PATH to enable.
  *
  * A single WebSocket connection multiplexes any number of concurrent
- * planning sessions. Plan content streams to the browser live via the
- * plan-file VFS, and Claude's AskUserQuestion / ExitPlanMode tool calls are
- * answered from the browser UI.
+ * sessions. The UI is a Vite build served from web/dist (`bun run build`);
+ * during development run `bun run dev:ui` for the Vite dev server, which
+ * proxies /ws here.
  *
  * Usage: bun run web/server.ts   (PORT defaults to 3000)
  */
 
+import { existsSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import type { ServerWebSocket } from "bun";
 import type { ClientMessage, ServerMessage } from "./lib/protocol";
-import { makeRunner, PlanSession, resolveRepoMode } from "./lib/session";
+import { ClaudeSession, makeRunner, resolveRepoMode } from "./lib/session";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PUBLIC_DIR = path.join(__dirname, "public");
+const DIST_DIR = path.join(__dirname, "dist");
 const PORT = Number(process.env.PORT ?? 3000);
 
 const repoMode = resolveRepoMode();
 const runner = makeRunner(repoMode);
 
 interface SocketData {
-  sessions: Map<string, PlanSession>;
+  sessions: Map<string, ClaudeSession>;
 }
 
 async function serveStatic(pathname: string): Promise<Response> {
+  if (!existsSync(DIST_DIR)) {
+    return new Response("UI build not found — run `bun run build` first.", { status: 503 });
+  }
   const rel = pathname === "/" ? "index.html" : pathname.slice(1);
-  const filePath = path.join(PUBLIC_DIR, rel);
-  if (!path.normalize(filePath).startsWith(PUBLIC_DIR + path.sep)) {
+  const filePath = path.join(DIST_DIR, rel);
+  if (!path.normalize(filePath).startsWith(DIST_DIR + path.sep)) {
     return new Response("Forbidden", { status: 403 });
   }
   const file = Bun.file(filePath);
@@ -84,10 +90,17 @@ const server = Bun.serve<SocketData, never>({
           sendTo(ws, { type: "error", sessionId, message: "Session already started" });
           return;
         }
-        const session = new PlanSession((event) => sendTo(ws, { ...event, sessionId }), runner);
+        const session = new ClaudeSession((event) => sendTo(ws, { ...event, sessionId }), runner);
         ws.data.sessions.set(sessionId, session);
         void session
-          .start({ prompt: msg.prompt, repo: msg.repo, branch: msg.branch, auth: msg.auth })
+          .start({
+            prompt: msg.prompt,
+            repo: msg.repo,
+            branch: msg.branch,
+            mode: msg.mode,
+            stopOnPlanApproval: msg.stopOnPlanApproval,
+            auth: msg.auth,
+          })
           .finally(() => ws.data.sessions.delete(sessionId));
         return;
       }
@@ -109,11 +122,14 @@ function sendTo(ws: ServerWebSocket<SocketData>, msg: ServerMessage): void {
   }
 }
 
-console.log(`[cc-planner] listening on http://localhost:${server.port}`);
+console.log(`[claude-web-tty] listening on http://localhost:${server.port}`);
 if (repoMode.mode === "baked") {
   console.log(
-    `[cc-planner] baked mode: planning against ${repoMode.repo ?? repoMode.root} @ ${repoMode.ref?.slice(0, 12)}`,
+    `[claude-web-tty] baked mode: workspace ${repoMode.repo ?? repoMode.root} @ ${repoMode.ref?.slice(0, 12)}`,
   );
 } else {
-  console.log("[cc-planner] lazy hydration mode: repos are blob-less-cloned per session");
+  console.log("[claude-web-tty] lazy hydration mode: repos are blob-less-cloned per session");
+}
+if (!existsSync(DIST_DIR)) {
+  console.warn("[claude-web-tty] web/dist missing — run `bun run build` (or use `bun run dev:ui`)");
 }

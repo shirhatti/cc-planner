@@ -1,13 +1,15 @@
 /**
- * <cc-session-list> — sidebar list of planning sessions (live and restored
- * from localStorage). Emits "select-session" and "delete-session" with
- * { id }.
+ * <cc-session-list> — sidebar list of sessions (live and restored from
+ * localStorage). Emits "select-session" and "delete-session" with { id }.
  */
 
-const STATUS_LABELS = {
+import type { SessionRecord, SessionStatus } from "../store";
+
+const STATUS_LABELS: Record<SessionStatus, string> = {
   draft: "draft",
   starting: "starting",
   running: "running",
+  idle: "awaiting message",
   "awaiting-input": "needs input",
   reviewing: "review plan",
   approved: "approved",
@@ -17,8 +19,7 @@ const STATUS_LABELS = {
 };
 
 export class CcSessionList extends HTMLElement {
-  /** @param {Array} sessions newest-first records; @param {string} activeId */
-  update(sessions, activeId) {
+  update(sessions: SessionRecord[], activeId: string | null): void {
     this.innerHTML = "";
     for (const s of sessions) {
       const item = document.createElement("div");
@@ -50,11 +51,11 @@ export class CcSessionList extends HTMLElement {
 
       const prompt = document.createElement("div");
       prompt.className = "session-prompt";
-      prompt.textContent = s.prompt || "New plan";
+      prompt.textContent = s.prompt || "New session";
 
       const meta = document.createElement("div");
       meta.className = "session-meta muted";
-      meta.textContent = `${STATUS_LABELS[s.status] ?? s.status} · ${new Date(s.createdAt).toLocaleString()}`;
+      meta.textContent = `${s.mode ?? "plan"} · ${STATUS_LABELS[s.status] ?? s.status} · ${new Date(s.createdAt).toLocaleString()}`;
 
       item.append(top, prompt, meta);
       this.append(item);
@@ -63,3 +64,9 @@ export class CcSessionList extends HTMLElement {
 }
 
 customElements.define("cc-session-list", CcSessionList);
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "cc-session-list": CcSessionList;
+  }
+}

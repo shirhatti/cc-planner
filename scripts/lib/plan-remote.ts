@@ -1,6 +1,7 @@
 /**
- * High-level API: run a Claude Code plan-mode session against a GitHub repo
- * without a full clone.
+ * High-level API: run a Claude Code session against a GitHub repo without a
+ * full clone. Defaults to plan mode, but any permission mode works — the
+ * web TTY uses this with streaming input for interactive sessions.
  *
  * Everything below is handled internally:
  * - a blob-less, checkout-less clone (commit/tree metadata only) into a
@@ -10,7 +11,13 @@
  * - child env fixups for running inside a Claude Code sandbox
  */
 
-import { query, type CanUseTool, type Query } from "@anthropic-ai/claude-agent-sdk";
+import {
+  query,
+  type CanUseTool,
+  type PermissionMode,
+  type Query,
+  type SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import { mkdtempSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
@@ -26,10 +33,12 @@ const VFS_HYDRATE = path.join(__dirname, "..", "..", "preload", "vfs-hydrate.ts"
 export interface RemotePlanOptions {
   /** GitHub repository as "owner/repo". */
   repo: string;
-  /** The planning prompt to send to Claude. */
-  prompt: string;
+  /** A one-shot prompt, or a stream of user messages for multi-turn sessions. */
+  prompt: string | AsyncIterable<SDKUserMessage>;
   /** Branch or tag to plan against. Defaults to the repo's default branch. */
   branch?: string;
+  /** Permission mode for the session. Defaults to "plan". */
+  permissionMode?: PermissionMode;
   /**
    * How file contents are fetched: "gh" uses the GitHub contents API,
    * "git" lazily fetches blobs from the promisor remote. Defaults to "gh"
@@ -40,7 +49,7 @@ export interface RemotePlanOptions {
   onPlan?: (content: string, filename: string) => void;
   /** Called for every VFS IPC message (hydrate_fetch, vfs_write, ...). */
   onVfsMessage?: (msg: VfsMessage) => void;
-  /** Permission callback — lets the host answer AskUserQuestion / ExitPlanMode. */
+  /** Permission callback — lets the host answer tool permission requests. */
   canUseTool?: CanUseTool;
   /** Abort controller for cancelling the session. */
   abortController?: AbortController;
@@ -81,7 +90,7 @@ export function planRemoteRepo(options: RemotePlanOptions): RemotePlanSession {
     prompt: options.prompt,
     options: {
       env: childEnv,
-      permissionMode: "plan",
+      permissionMode: options.permissionMode ?? "plan",
       executable: "bun",
       cwd: root,
       canUseTool: options.canUseTool,
