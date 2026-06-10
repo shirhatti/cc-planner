@@ -6,11 +6,12 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
+    "start": "bun run web/server.ts",
     "test": "bun test",
-    "lint": "eslint preload/ scripts/",
-    "lint:fix": "eslint --fix preload/ scripts/",
-    "format": "prettier --write preload/ scripts/",
-    "format:check": "prettier --check preload/ scripts/",
+    "lint": "eslint preload/ scripts/ web/",
+    "lint:fix": "eslint --fix preload/ scripts/ web/",
+    "format": "prettier --write preload/ scripts/ web/",
+    "format:check": "prettier --check preload/ scripts/ web/",
     "prepare": "husky"
   },
   "lint-staged": {

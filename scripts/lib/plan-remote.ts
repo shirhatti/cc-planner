@@ -10,7 +10,7 @@
  * - child env fixups for running inside a Claude Code sandbox
  */
 
-import { query, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type CanUseTool, type Query } from "@anthropic-ai/claude-agent-sdk";
 import { mkdtempSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
@@ -40,6 +40,15 @@ export interface RemotePlanOptions {
   onPlan?: (content: string, filename: string) => void;
   /** Called for every VFS IPC message (hydrate_fetch, vfs_write, ...). */
   onVfsMessage?: (msg: VfsMessage) => void;
+  /** Permission callback — lets the host answer AskUserQuestion / ExitPlanMode. */
+  canUseTool?: CanUseTool;
+  /** Abort controller for cancelling the session. */
+  abortController?: AbortController;
+  /**
+   * Extra env vars for the child claude process, applied last — e.g.
+   * ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN to route through an LLM gateway.
+   */
+  extraEnv?: Record<string, string>;
 }
 
 export interface RemotePlanSession {
@@ -59,7 +68,7 @@ export function planRemoteRepo(options: RemotePlanOptions): RemotePlanSession {
   const strategy = options.strategy ?? (ghAvailable() ? "gh" : "git");
   const root = mkdtempSync(path.join(tmpdir(), "cc-planner-"));
   const clone = bloblessClone(options.repo, root, options.branch);
-  const childEnv = { ...buildChildEnv(), ...hydrateEnv(clone, strategy) };
+  const childEnv = { ...buildChildEnv(), ...hydrateEnv(clone, strategy), ...options.extraEnv };
 
   const handleMessage = (msg: VfsMessage): void => {
     if (msg.type === "plan_file_write" && options.onPlan) {
@@ -75,6 +84,8 @@ export function planRemoteRepo(options: RemotePlanOptions): RemotePlanSession {
       permissionMode: "plan",
       executable: "bun",
       cwd: root,
+      canUseTool: options.canUseTool,
+      abortController: options.abortController,
       spawnClaudeCodeProcess: makeSpawnWithPreloads([VFS_VIRTUAL, VFS_HYDRATE], handleMessage),
     },
   });

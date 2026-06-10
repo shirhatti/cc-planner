@@ -1,0 +1,521 @@
+:root {
+  --bg: #14161a;
+  --panel: #1c1f26;
+  --panel-2: #232730;
+  --border: #2e3340;
+  --text: #e6e8ee;
+  --muted: #8b91a0;
+  --accent: #d97757;
+  --accent-2: #6a9fb5;
+  --good: #4caf7d;
+  --bad: #d9596a;
+  --warn: #d9b357;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font:
+    14px/1.5 system-ui,
+    -apple-system,
+    sans-serif;
+}
+
+cc-app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+cc-app > header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+cc-app > header h1 {
+  font-size: 16px;
+  margin: 0;
+}
+
+.badge {
+  font-size: 12px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--accent-2);
+}
+
+.status {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  min-height: 0;
+}
+
+/* ---- sidebar ---- */
+
+aside {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-right: 1px solid var(--border);
+  min-height: 0;
+  overflow-y: auto;
+}
+
+cc-session-list {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.session-item {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.session-item:hover {
+  border-color: var(--accent-2);
+}
+
+.session-item.active {
+  border-color: var(--accent);
+}
+
+.session-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+
+.status-dot.running,
+.status-dot.starting {
+  background: var(--accent-2);
+}
+
+.status-dot.awaiting-input,
+.status-dot.reviewing {
+  background: var(--warn);
+}
+
+.status-dot.approved,
+.status-dot.done {
+  background: var(--good);
+}
+
+.status-dot.error {
+  background: var(--bad);
+}
+
+.session-repo {
+  flex: 1;
+  font-size: 12px;
+  color: var(--accent-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-delete {
+  background: none;
+  border: none;
+  color: var(--muted);
+  padding: 0 2px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.session-delete:hover {
+  color: var(--bad);
+}
+
+.session-prompt {
+  font-size: 12px;
+  margin-top: 2px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.session-meta {
+  margin-top: 2px;
+  font-size: 11px;
+}
+
+/* ---- settings ---- */
+
+.settings {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.settings summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.settings label {
+  display: block;
+  margin: 8px 0 2px;
+}
+
+.settings label span {
+  display: block;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+
+/* ---- main columns ---- */
+
+main {
+  display: grid;
+  grid-template-columns: minmax(340px, 5fr) minmax(400px, 6fr);
+  min-height: 0;
+}
+
+.left,
+.right {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 14px;
+}
+
+.left {
+  border-right: 1px solid var(--border);
+}
+
+/* ---- start form / session summary ---- */
+
+cc-start-form {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.start-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+input,
+textarea {
+  width: 100%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 10px;
+  font: inherit;
+  resize: vertical;
+}
+
+input:focus,
+textarea:focus {
+  outline: 1px solid var(--accent-2);
+}
+
+button {
+  background: var(--accent);
+  border: none;
+  border-radius: 8px;
+  color: #fff;
+  padding: 8px 16px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.new-session {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+}
+
+.new-session:hover {
+  border-color: var(--accent);
+}
+
+.session-summary {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.summary-prompt {
+  font-weight: 600;
+}
+
+.summary-meta {
+  margin-top: 6px;
+  justify-content: space-between;
+}
+
+button.stop {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  padding: 4px 12px;
+}
+
+/* ---- feed ---- */
+
+.feeds {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+cc-feed {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+.feed-item {
+  border-radius: 8px;
+  padding: 8px 12px;
+  flex: none;
+}
+
+.assistant {
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+.assistant p:first-child,
+.assistant h1:first-child,
+.assistant h2:first-child {
+  margin-top: 4px;
+}
+
+.tool,
+.info {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 0 4px;
+}
+
+.tool .tool-name {
+  color: var(--accent-2);
+  font-weight: 600;
+}
+
+.tool .tool-detail,
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.error-item {
+  background: rgba(217, 89, 106, 0.12);
+  border: 1px solid var(--bad);
+  padding: 8px 12px;
+}
+
+.restored-note {
+  padding: 8px 4px;
+}
+
+/* ---- question cards ---- */
+
+cc-question-card {
+  display: block;
+  background: var(--panel-2);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 12px;
+  flex: none;
+}
+
+cc-question-card .chip {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+cc-question-card .q-text {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.option {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+
+.option:hover {
+  border-color: var(--accent-2);
+}
+
+.option.selected {
+  border-color: var(--accent);
+  background: rgba(217, 119, 87, 0.1);
+}
+
+.option .opt-desc {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+cc-question-card input.other {
+  margin-top: 4px;
+}
+
+cc-question-card .submit-row {
+  margin-top: 10px;
+}
+
+cc-question-card.answered {
+  opacity: 0.6;
+  border-color: var(--border);
+}
+
+/* ---- plan panel ---- */
+
+cc-plan-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.plan-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.plan-header h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.plan-body {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 4px 18px;
+  min-height: 0;
+}
+
+.plan-body:empty {
+  display: none;
+}
+
+.plan-body h1,
+.plan-body h2,
+.plan-body h3 {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 4px;
+}
+
+.plan-body pre {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  overflow-x: auto;
+}
+
+.plan-body code {
+  font-size: 13px;
+}
+
+.plan-body :not(pre) > code {
+  background: var(--panel-2);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+/* ---- plan review ---- */
+
+.plan-review {
+  margin-top: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.plan-review[hidden] {
+  display: none;
+}
+
+.review-title {
+  font-weight: 600;
+}
+
+button.approve {
+  background: var(--good);
+}
+
+button.reject {
+  background: var(--bad);
+}

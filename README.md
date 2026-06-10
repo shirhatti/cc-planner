@@ -5,6 +5,8 @@ Two complementary Virtual File Systems (VFS) for Claude Code's Plan Mode, both i
 1. **Virtual plan files** (`preload/vfs-virtual.ts`) — plan files are kept entirely in memory and never touch disk, allowing real-time streaming of plan content via IPC.
 2. **Hydrating repo files** (`preload/vfs-hydrate.ts`) — Claude Code can plan against a repo cloned with `--filter=blob:none --no-checkout` (no file contents downloaded). Files are hydrated on demand via the `gh` CLI the first time Claude reads them, so **a fully cloned repo is never needed**.
 
+On top of this infra, `web/` provides a **browser app for plan-mode sessions** — see [Web App](#web-app).
+
 ## Overview
 
 When Claude Code operates in Plan Mode, it writes plan files to `~/.claude/plans/`. This VFS intercepts all filesystem operations for that directory and virtualizes them completely in memory.
@@ -60,6 +62,78 @@ The suite covers both VFS layers:
 
 1. **Virtual VFS** - Plan files never touch disk; regular files pass through
 2. **Hydrating VFS** - Files in a blob-less clone are fetched on demand (tests run fully offline against a local fixture repo and a fake `gh`)
+
+## Web App
+
+`web/` is a browser UI for running plan-mode sessions on top of the VFS infra:
+
+```bash
+bun run start          # serves http://localhost:3000 (PORT to override)
+```
+
+**Features**
+
+- **Multiple concurrent sessions** — a sidebar lists every planning session; sessions run in parallel, each in its own claude process, multiplexed over one WebSocket.
+- **Live plan streaming** — the plan panel renders the plan markdown in real time as Claude writes it, via the plan-file VFS IPC events.
+- **AskUserQuestion in the browser** — when Claude calls the `AskUserQuestion` tool, the question card (header chips, 2-4 options with descriptions, multi-select, free-text "Other") renders inline in the session feed. Your selection is returned to the tool call through the SDK's `canUseTool` permission callback.
+- **Plan review** — when Claude calls `ExitPlanMode`, a review bar appears: **Approve plan** ends the session with the approved plan as the deliverable (the session is interrupted so Claude never starts implementing), **Request changes** denies the tool call with your feedback so Claude revises the plan and resubmits.
+- **localStorage persistence** — prompts, repo metadata, status, and the latest plan of every session persist in the browser; restored sessions show their saved plan after a reload (live transcripts are not persisted).
+- **LLM gateway support** — the sidebar's _Gateway settings_ let you set an Anthropic base URL and bearer token (stored in the browser, sent per session). They become `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` in the child claude process, so traffic can route through a gateway such as LiteLLM. Leave empty to use the server's environment.
+
+The frontend is vanilla JavaScript organized as Web Components (`web/public/js/components/`) — no build step.
+
+### Repo modes
+
+| Mode                         | Repo contents                                                              | When                                                                |
+| ---------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| **Lazy hydration** (default) | Blob-less clone per session; file contents hydrated on Claude's first read | Plan against any repo without downloading it                        |
+| **Baked**                    | Full clone burned into the container image at build time                   | Zero clone/hydration latency and no GitHub access needed at runtime |
+
+Baked mode is enabled by pointing `CC_BAKED_REPO_PATH` at a checkout (plus optional `CC_BAKED_REPO=owner/repo` as a label); the Dockerfile wires this up automatically.
+
+### Docker
+
+```bash
+# Lazy hydration mode
+docker build -t cc-planner .
+docker run -p 3000:3000 -e ANTHROPIC_API_KEY=sk-ant-... cc-planner
+
+# Bake a repo into the image at build time
+docker build -t cc-planner-baked \
+  --build-arg BAKE_REPO=owner/repo \
+  --build-arg BAKE_REF=main \
+  .
+docker run -p 3000:3000 -e ANTHROPIC_API_KEY=sk-ant-... cc-planner-baked
+```
+
+For a private repo at build time, pass `--build-arg BAKE_TOKEN=$(gh auth token)` (prefer an ephemeral fine-grained token: build args are recorded in image metadata). Instead of `ANTHROPIC_API_KEY` you can set `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` on the container, or supply them per session from the browser's gateway settings.
+
+### Web architecture
+
+```
+browser (Web Components)  ←WebSocket→  web/server.ts (Bun.serve)
+  cc-app / cc-feed / cc-plan-panel       PlanSession (web/lib/session.ts)
+  cc-question-card / cc-session-list       ├─ canUseTool → ask_user_question / plan_review round-trips
+  cc-settings-panel (localStorage)         ├─ planRemoteRepo() — lazy hydration mode
+                                           └─ planBakedRepo()  — baked mode
+```
+
+Every session-scoped WebSocket message carries a client-generated `sessionId` (`web/lib/protocol.ts`), which is how one socket multiplexes many sessions.
+
+## Environment Variables
+
+All `CC_`-prefixed env vars in one place:
+
+| Variable              | Read by                  | Default                         | Description                                                                                                                                                                                            |
+| --------------------- | ------------------------ | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `CC_BAKED_REPO_PATH`  | `web/server.ts`          | unset                           | Path to a fully checked-out repo. If the directory exists, the web app runs in **baked** mode and plans against it; otherwise it runs in **lazy hydration** mode. The Dockerfile sets this to `/repo`. |
+| `CC_BAKED_REPO`       | `web/server.ts`          | unset                           | `owner/repo` label for the baked checkout, shown in the UI and session records. Set from the `BAKE_REPO` build arg by the Dockerfile.                                                                  |
+| `CC_HYDRATE_ROOT`     | `preload/vfs-hydrate.ts` | unset (preload is inert)        | Path of the blob-less working tree to hydrate into.                                                                                                                                                    |
+| `CC_HYDRATE_REPO`     | `preload/vfs-hydrate.ts` | parsed from the `origin` remote | `owner/repo` used for `gh api` content fetches.                                                                                                                                                        |
+| `CC_HYDRATE_REF`      | `preload/vfs-hydrate.ts` | `HEAD`'s sha                    | Commit to hydrate file contents from.                                                                                                                                                                  |
+| `CC_HYDRATE_STRATEGY` | `preload/vfs-hydrate.ts` | `gh`                            | How contents are fetched: `gh` (GitHub contents API) or `git` (promisor lazy fetch). See [Hydration Strategies](#hydration-strategies).                                                                |
+
+The `CC_HYDRATE_*` vars are set automatically by `planRemoteRepo()` for the child claude process — you only set them yourself when wiring up `preload/vfs-hydrate.ts` manually (see [Configuration](#configuration)). The `CC_BAKED_*` vars configure the web server's repo mode and are normally set by the Dockerfile.
 
 ## Usage Example
 
@@ -348,19 +422,36 @@ cc-planner/
 ├── package.json
 ├── tsconfig.json
 ├── README.md
+├── Dockerfile                  # Web app image; BAKE_REPO arg bakes a repo in
 ├── preload/
 │   ├── vfs-virtual.ts          # In-memory VFS for plan files
 │   └── vfs-hydrate.ts          # On-demand hydration over blob-less clones
-└── scripts/
-    ├── sdk-example.ts          # Runnable SDK example (sandbox-safe)
-    ├── plan-remote-repo.ts     # Plan against a repo without cloning it
+├── scripts/
+│   ├── sdk-example.ts          # Runnable SDK example (sandbox-safe)
+│   ├── plan-remote-repo.ts     # Plan against a repo without cloning it
+│   ├── lib/
+│   │   ├── plan-remote.ts      # planRemoteRepo() high-level API
+│   │   ├── plan-baked.ts       # planBakedRepo() for baked-in checkouts
+│   │   ├── blobless-clone.ts   # Internal: blob-less clone helper
+│   │   ├── child-env.ts        # Internal: sandbox auth env fixups
+│   │   └── spawn-vfs.ts        # Internal: SDK spawn fn with preloads
+│   ├── vfs-virtual.test.ts     # Bun test suite (plan-file VFS)
+│   └── vfs-hydrate.test.ts     # Bun test suite (hydrating VFS, offline)
+└── web/
+    ├── server.ts               # Bun HTTP + WebSocket server
     ├── lib/
-    │   ├── plan-remote.ts      # planRemoteRepo() high-level API
-    │   ├── blobless-clone.ts   # Internal: blob-less clone helper
-    │   ├── child-env.ts        # Internal: sandbox auth env fixups
-    │   └── spawn-vfs.ts        # Internal: SDK spawn fn with preloads
-    ├── vfs-virtual.test.ts     # Bun test suite (plan-file VFS)
-    └── vfs-hydrate.test.ts     # Bun test suite (hydrating VFS, offline)
+    │   ├── protocol.ts         # Browser <-> server message types
+    │   └── session.ts          # PlanSession: SDK <-> browser bridge
+    ├── session.test.ts         # Bun test suite (session bridge, offline)
+    └── public/                 # Web Components UI (no build step)
+        ├── index.html
+        ├── style.css
+        └── js/
+            ├── cc-app.js       # Root component: WS + session orchestration
+            ├── store.js        # localStorage persistence
+            ├── markdown.js     # Minimal safe markdown renderer
+            └── components/     # cc-feed, cc-plan-panel, cc-question-card,
+                                # cc-session-list, cc-start-form, cc-settings-panel
 ```
 
 ## Implementation Details
