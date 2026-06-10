@@ -50,6 +50,9 @@ async function serveStatic(pathname: string): Promise<Response> {
   if (!(await file.exists())) {
     return new Response("Not found", { status: 404 });
   }
+  if (filePath.endsWith(".webmanifest")) {
+    return new Response(file, { headers: { "content-type": "application/manifest+json" } });
+  }
   return new Response(file);
 }
 
