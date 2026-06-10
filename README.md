@@ -120,6 +120,21 @@ browser (Web Components)  ←WebSocket→  web/server.ts (Bun.serve)
 
 Every session-scoped WebSocket message carries a client-generated `sessionId` (`web/lib/protocol.ts`), which is how one socket multiplexes many sessions.
 
+## Environment Variables
+
+All `CC_`-prefixed env vars in one place:
+
+| Variable              | Read by                  | Default                         | Description                                                                                                                                                                                            |
+| --------------------- | ------------------------ | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `CC_BAKED_REPO_PATH`  | `web/server.ts`          | unset                           | Path to a fully checked-out repo. If the directory exists, the web app runs in **baked** mode and plans against it; otherwise it runs in **lazy hydration** mode. The Dockerfile sets this to `/repo`. |
+| `CC_BAKED_REPO`       | `web/server.ts`          | unset                           | `owner/repo` label for the baked checkout, shown in the UI and session records. Set from the `BAKE_REPO` build arg by the Dockerfile.                                                                  |
+| `CC_HYDRATE_ROOT`     | `preload/vfs-hydrate.ts` | unset (preload is inert)        | Path of the blob-less working tree to hydrate into.                                                                                                                                                    |
+| `CC_HYDRATE_REPO`     | `preload/vfs-hydrate.ts` | parsed from the `origin` remote | `owner/repo` used for `gh api` content fetches.                                                                                                                                                        |
+| `CC_HYDRATE_REF`      | `preload/vfs-hydrate.ts` | `HEAD`'s sha                    | Commit to hydrate file contents from.                                                                                                                                                                  |
+| `CC_HYDRATE_STRATEGY` | `preload/vfs-hydrate.ts` | `gh`                            | How contents are fetched: `gh` (GitHub contents API) or `git` (promisor lazy fetch). See [Hydration Strategies](#hydration-strategies).                                                                |
+
+The `CC_HYDRATE_*` vars are set automatically by `planRemoteRepo()` for the child claude process — you only set them yourself when wiring up `preload/vfs-hydrate.ts` manually (see [Configuration](#configuration)). The `CC_BAKED_*` vars configure the web server's repo mode and are normally set by the Dockerfile.
+
 ## Usage Example
 
 Use the VFS with the Claude Agent SDK by providing a custom spawn function:
