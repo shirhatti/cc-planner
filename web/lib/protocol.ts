@@ -101,8 +101,18 @@ export type SessionEvent =
   | { type: "plan_update"; filename: string; content: string }
   /** Claude called AskUserQuestion — render the questions and reply. */
   | { type: "ask_user_question"; id: string; questions: UserQuestion[] }
-  /** Claude called ExitPlanMode — approve or request changes. */
-  | { type: "plan_review"; id: string; allowedPrompts: { tool: string; prompt: string }[] }
+  /**
+   * Claude called ExitPlanMode — approve or request changes. `plan` is the
+   * plan content the CLI injected into the tool input from the plan file;
+   * the server also re-emits it as a plan_update so the panel is always
+   * current, even if no plan_file_write event was streamed.
+   */
+  | {
+      type: "plan_review";
+      id: string;
+      allowedPrompts: { tool: string; prompt: string }[];
+      plan?: string;
+    }
   | { type: "plan_decided"; approved: boolean }
   /** Live (and finally authoritative) duration/token/cost statistics. */
   | { type: "session_stats"; stats: SessionStats }

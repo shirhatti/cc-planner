@@ -17,6 +17,11 @@ export class CcPlanPanel extends HTMLElement {
       <article class="plan-body"></article>
       <div class="plan-review" hidden>
         <div class="review-title">Claude is ready to finalize this plan.</div>
+        <div class="review-note muted" hidden>
+          No plan content was provided for this review — Claude exited plan mode
+          without writing a plan. Consider requesting changes and asking for a
+          written plan.
+        </div>
         <div class="allowed-prompts muted"></div>
         <textarea class="review-feedback" rows="2"
           placeholder="Optional: what should change? (used when requesting changes)"></textarea>
@@ -58,6 +63,7 @@ export class CcPlanPanel extends HTMLElement {
 
   showReview({ id, allowedPrompts }) {
     this.reviewId = id;
+    this.querySelector(".review-note").hidden = this.body.innerHTML.trim() !== "";
     this.querySelector(".allowed-prompts").textContent = allowedPrompts?.length
       ? `Implementation would need permission to: ${allowedPrompts.map((p) => p.prompt).join("; ")}`
       : "";

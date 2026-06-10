@@ -11,6 +11,7 @@
  */
 
 import { existsSync } from "fs";
+import path from "path";
 import type { CanUseTool, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { planBakedRepo, resolveBakedRef } from "../../scripts/lib/plan-baked";
 import { planRemoteRepo } from "../../scripts/lib/plan-remote";
@@ -256,8 +257,20 @@ export class PlanSession {
 
     if (toolName === "ExitPlanMode") {
       const allowedPrompts = (input.allowedPrompts ?? []) as { tool: string; prompt: string }[];
+      // The CLI injects the plan-file content into the tool input. Re-emit it
+      // as a plan_update so the review always has a preview — the plan file
+      // itself may have been written through an API the plan-file VFS doesn't
+      // intercept (e.g. fs.promises), or never written at all.
+      const plan = typeof input.plan === "string" ? input.plan : "";
+      if (plan.trim()) {
+        const filename =
+          typeof input.filePath === "string" && input.filePath
+            ? path.basename(input.filePath)
+            : "plan.md";
+        this.send({ type: "plan_update", filename, content: plan });
+      }
       const reply = await this.waitForClient(
-        { type: "plan_review", id: toolUseID, allowedPrompts },
+        { type: "plan_review", id: toolUseID, allowedPrompts, plan: plan || undefined },
         toolUseID,
         signal,
       );

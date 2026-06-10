@@ -182,6 +182,48 @@ describe("PlanSession", () => {
     expect(results[0]).toEqual({ behavior: "deny", message: "Add a rollout section" });
   });
 
+  test("plan injected into ExitPlanMode input is surfaced before the review", async () => {
+    const sent: SessionEvent[] = [];
+    const runner = fakeRunner(async function* (args) {
+      await args.canUseTool(
+        "ExitPlanMode",
+        { plan: "# Injected Plan", filePath: "/root/.claude/plans/witty-name.md" },
+        toolOptions("tu_6"),
+      );
+      yield* [] as SDKMessage[];
+    });
+
+    const session: PlanSession = new PlanSession((msg) => {
+      sent.push(msg);
+      if (msg.type === "plan_review") {
+        session.handleClientMessage({
+          type: "plan_decision",
+          sessionId: "s1",
+          id: msg.id,
+          approved: false,
+          feedback: "no",
+        });
+      }
+    }, runner);
+
+    await session.start({ prompt: "p" });
+
+    const planIdx = sent.findIndex((m) => m.type === "plan_update");
+    const reviewIdx = sent.findIndex((m) => m.type === "plan_review");
+    expect(sent[planIdx]).toEqual({
+      type: "plan_update",
+      filename: "witty-name.md",
+      content: "# Injected Plan",
+    });
+    expect(planIdx).toBeLessThan(reviewIdx);
+    expect(sent[reviewIdx]).toEqual({
+      type: "plan_review",
+      id: "tu_6",
+      allowedPrompts: [],
+      plan: "# Injected Plan",
+    });
+  });
+
   test("other tools are allowed without a browser round-trip", async () => {
     const results: PermissionResult[] = [];
     const runner = fakeRunner(async function* (args) {
