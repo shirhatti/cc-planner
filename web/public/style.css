@@ -491,6 +491,82 @@ cc-plan-panel {
   padding: 1px 5px;
 }
 
+/* ---- session stats ---- */
+
+cc-stats-panel {
+  display: block;
+  margin-top: 10px;
+}
+
+.stats-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+.stats-panel summary {
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.stats-title {
+  font-weight: 600;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.stat {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  display: flex;
+  flex-direction: column;
+}
+
+.stat-label {
+  font-size: 11px;
+}
+
+.stat-value {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.stats-models {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.stats-models th,
+.stats-models td {
+  text-align: right;
+  padding: 4px 8px;
+  border-top: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+
+.stats-models th:first-child,
+.stats-models td:first-child {
+  text-align: left;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.stats-models th {
+  color: var(--muted);
+  font-weight: 500;
+}
+
 /* ---- plan review ---- */
 
 .plan-review {

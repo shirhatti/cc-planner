@@ -31,6 +31,8 @@ export default tseslint.config(
         customElements: "readonly",
         crypto: "readonly",
         setTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
       },
     },
   },

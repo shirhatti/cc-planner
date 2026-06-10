@@ -266,6 +266,81 @@ describe("PlanSession", () => {
     expect(sent.at(-1)?.type).toBe("session_done");
   });
 
+  test("streams live and final session stats", async () => {
+    const sent: SessionEvent[] = [];
+    const usage = {
+      input_tokens: 10,
+      output_tokens: 20,
+      cache_read_input_tokens: 30,
+      cache_creation_input_tokens: 40,
+    };
+    const runner = fakeRunner(async function* (args) {
+      args.onVfsMessage({ type: "hydrate_fetch", rel: "src/a.ts", size: 2048 });
+      yield {
+        type: "assistant",
+        message: { model: "claude-sonnet-4-5", usage, content: [] },
+      } as unknown as SDKMessage;
+      yield {
+        type: "result",
+        subtype: "success",
+        result: "ok",
+        duration_ms: 5000,
+        duration_api_ms: 4000,
+        num_turns: 3,
+        total_cost_usd: 0.5,
+        usage,
+        modelUsage: {
+          "claude-sonnet-4-5": {
+            inputTokens: 10,
+            outputTokens: 20,
+            cacheReadInputTokens: 30,
+            cacheCreationInputTokens: 40,
+            costUSD: 0.5,
+            webSearchRequests: 0,
+            contextWindow: 200000,
+            maxOutputTokens: 64000,
+          },
+        },
+      } as unknown as SDKMessage;
+    });
+
+    const session = new PlanSession((msg) => sent.push(msg), runner);
+    await session.start({ prompt: "p" });
+
+    const statsEvents = sent.filter(
+      (m): m is Extract<SessionEvent, { type: "session_stats" }> => m.type === "session_stats",
+    );
+    // One from the hydrate fetch, one from the assistant turn, one final.
+    expect(statsEvents).toHaveLength(3);
+
+    const expectedTotals = {
+      inputTokens: 10,
+      outputTokens: 20,
+      cacheReadTokens: 30,
+      cacheCreationTokens: 40,
+    };
+
+    const live = statsEvents[1].stats;
+    expect(live.final).toBe(false);
+    expect(live.totals).toEqual(expectedTotals);
+    expect(live.byModel["claude-sonnet-4-5"]).toEqual(expectedTotals);
+    expect(live.filesHydrated).toBe(1);
+    expect(live.bytesFetched).toBe(2048);
+
+    const final = statsEvents[2].stats;
+    expect(final).toEqual({
+      durationMs: 5000,
+      apiDurationMs: 4000,
+      numTurns: 3,
+      costUsd: 0.5,
+      totals: expectedTotals,
+      byModel: { "claude-sonnet-4-5": { ...expectedTotals, costUsd: 0.5 } },
+      filesHydrated: 1,
+      bytesFetched: 2048,
+      final: true,
+    });
+  });
+
   test("gateway auth is passed to the runner env", async () => {
     let seenEnv: Record<string, string> | undefined;
     const runner = fakeRunner(async function* (args) {
