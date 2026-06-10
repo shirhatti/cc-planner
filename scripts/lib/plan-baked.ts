@@ -12,6 +12,8 @@
 import {
   query,
   type CanUseTool,
+  type HookCallbackMatcher,
+  type HookEvent,
   type PermissionMode,
   type Query,
   type SDKUserMessage,
@@ -35,6 +37,8 @@ export interface BakedPlanOptions {
   permissionMode?: PermissionMode;
   /** Extra instructions appended to the standard Claude Code system prompt. */
   appendSystemPrompt?: string;
+  /** Hook callbacks (e.g. a PreToolUse hook gating Bash commands). */
+  hooks?: Partial<Record<HookEvent, HookCallbackMatcher[]>>;
   /** Called with the plan content whenever a plan file is finalized. */
   onPlan?: (content: string, filename: string) => void;
   /** Called for every VFS IPC message (vfs_write, plan_file_write, ...). */
@@ -87,6 +91,7 @@ export function planBakedRepo(options: BakedPlanOptions): BakedPlanSession {
         : undefined,
       executable: "bun",
       cwd: options.root,
+      hooks: options.hooks,
       canUseTool: options.canUseTool,
       abortController: options.abortController,
       spawnClaudeCodeProcess: makeSpawnWithPreloads([VFS_VIRTUAL], handleMessage),

@@ -417,6 +417,62 @@ describe("ClaudeSession", () => {
     expect(sent.filter((m) => m.type === "permission_request")).toHaveLength(1);
   });
 
+  test("PreToolUse hook gates Bash even when the permission system would auto-allow", async () => {
+    // Plan mode auto-allows read-only Bash without consulting canUseTool, so
+    // the policy must also be enforced through a PreToolUse hook.
+    const sent: SessionEvent[] = [];
+    const hookOutputs: unknown[] = [];
+
+    const runner: SessionRunner = (args) => {
+      const gen = (async function* () {
+        const hook = args.hooks?.PreToolUse?.[0]?.hooks[0];
+        expect(args.hooks?.PreToolUse?.[0]?.matcher).toBe("Bash");
+        expect(hook).toBeDefined();
+        const signal = new AbortController().signal;
+        const base = {
+          hook_event_name: "PreToolUse" as const,
+          session_id: "x",
+          transcript_path: "/t",
+          cwd: "/w",
+          tool_name: "Bash",
+        };
+        hookOutputs.push(
+          await hook!(
+            { ...base, tool_input: { command: "find . -name x" }, tool_use_id: "h1" },
+            "h1",
+            { signal },
+          ),
+        );
+        hookOutputs.push(
+          await hook!({ ...base, tool_input: { command: "git log" }, tool_use_id: "h2" }, "h2", {
+            signal,
+          }),
+        );
+        hookOutputs.push(
+          await hook!({ ...base, tool_input: { command: "bun test" }, tool_use_id: "h3" }, "h3", {
+            signal,
+          }),
+        );
+        yield* [] as SDKMessage[];
+      })() as RunnerResult["session"];
+      return { session: gen, repo: "owner/repo", ref: "abc123def456" };
+    };
+
+    const session = new ClaudeSession((msg) => sent.push(msg), runner, {
+      hydratingWorkspace: true,
+    });
+    await session.start({ prompt: "p" });
+
+    expect(hookOutputs[0]).toMatchObject({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny" },
+    });
+    expect(hookOutputs[1]).toMatchObject({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+    });
+    expect(hookOutputs[2]).toEqual({});
+    expect(sent.some((m) => m.type === "notice" && m.text.includes("find"))).toBe(true);
+  });
+
   test("non-hydrating workspaces skip the Bash policy", async () => {
     const sent: SessionEvent[] = [];
     const runner = fakeRunner(async function* (args) {

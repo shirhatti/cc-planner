@@ -19,6 +19,9 @@ import { existsSync, readFileSync } from "fs";
 import path from "path";
 import type {
   CanUseTool,
+  HookCallback,
+  HookCallbackMatcher,
+  HookEvent,
   PermissionMode,
   SDKMessage,
   SDKUserMessage,
@@ -121,6 +124,7 @@ export interface RunnerArgs {
   prompt: string | AsyncIterable<SDKUserMessage>;
   permissionMode?: PermissionMode;
   appendSystemPrompt?: string;
+  hooks?: Partial<Record<HookEvent, HookCallbackMatcher[]>>;
   repo?: string;
   branch?: string;
   canUseTool: CanUseTool;
@@ -321,6 +325,9 @@ export class ClaudeSession {
         prompt: this.input,
         permissionMode: mode,
         appendSystemPrompt: this.options.hydratingWorkspace ? HYDRATION_GUIDANCE : undefined,
+        hooks: this.options.hydratingWorkspace
+          ? { PreToolUse: [{ matcher: "Bash", hooks: [this.bashPolicyHook] }] }
+          : undefined,
         repo: req.repo,
         branch: req.branch,
         extraEnv: gatewayEnv(req.auth),
@@ -381,6 +388,38 @@ export class ClaudeSession {
     this.input.done();
     this.abort.abort();
   }
+
+  /**
+   * PreToolUse hook gating Bash on hydrating workspaces. This runs before
+   * the permission system, so it also catches commands plan mode would
+   * auto-allow without consulting canUseTool (read-only find/cat/grep).
+   */
+  private readonly bashPolicyHook: HookCallback = async (input) => {
+    if (input.hook_event_name !== "PreToolUse" || input.tool_name !== "Bash") {
+      return {};
+    }
+    const command = String(
+      (input.tool_input as Record<string, unknown> | undefined)?.command ?? "",
+    );
+    const policy = evaluateBashCommand(command);
+    if (policy.verdict === "deny") {
+      this.send({ type: "notice", text: `Blocked \`${command}\` — ${policy.reason}` });
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: policy.reason,
+        },
+      };
+    }
+    if (policy.verdict === "allow") {
+      return {
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+      };
+    }
+    // "ask": let the normal permission flow (canUseTool → browser card) decide.
+    return {};
+  };
 
   private readonly canUseTool: CanUseTool = async (toolName, input, { toolUseID, signal }) => {
     if (toolName === "AskUserQuestion") {

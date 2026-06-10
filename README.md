@@ -86,6 +86,7 @@ bun run start & bun run dev:ui
 - **localStorage persistence** — prompts, repo metadata, status, stats, and the latest plan of every session persist in the browser (live transcripts are not persisted across reloads).
 - **LLM gateway support** — set an Anthropic base URL and bearer token in the sidebar; they become `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` in the child claude process.
 - **PWA** — installable, with a web manifest and an auto-updating service worker (app shell precached, hashed assets cached on demand).
+- **Hydration-aware Bash policy** — on lazy workspaces, shell commands that fight the VFS are blocked with guidance: `tree`/`find`/`ls -R`/`du` (the tree is served from the manifest — Glob/LS see it for free), `cat`/`head`/`tail`/direct `grep` on files (subprocesses only see already-hydrated files — Read hydrates on demand), recursive `grep`/`rg` and `git grep` (which promisor-fetches every blob it searches). Read-only git metadata commands and pipeline filters (`git log | head`) are auto-allowed. Enforced by a PreToolUse hook (so it catches commands plan mode would auto-allow) plus matching guidance appended to the system prompt, which in practice steers Claude to Glob/Read before any command is attempted (`web/lib/bash-policy.ts`).
 
 The frontend is TypeScript Web Components built with Vite (`web/src/`), typed against the shared WebSocket protocol (`web/lib/protocol.ts`).
 
