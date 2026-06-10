@@ -1,7 +1,7 @@
 /**
- * Public Claude API token pricing, used to estimate session cost in real
- * time while usage streams in. The SDK's final result message carries the
- * authoritative cost; these estimates only cover the gap until then.
+ * Public Claude API token pricing. All costs shown in the web UI — live and
+ * final — are estimated from these rates applied to the session's token
+ * usage; the SDK's own cost figure is intentionally never displayed.
  *
  * Source: https://platform.claude.com/docs/en/about-claude/pricing
  * (model pricing table; cache read = 0.1x input, 5m cache write = 1.25x

@@ -305,11 +305,13 @@ describe("PlanSession", () => {
     expect(sent.some((m) => m.type === "tool_activity" && m.name === "AskUserQuestion")).toBe(
       false,
     );
+    // No modelUsage in this result → no estimate; the SDK's total_cost_usd
+    // (0.12) must NOT leak through.
     expect(sent).toContainEqual({
       type: "result",
       subtype: "success",
       result: "Planned.",
-      costUsd: 0.12,
+      costUsd: undefined,
       durationMs: 4200,
     });
   });
@@ -408,15 +410,26 @@ describe("PlanSession", () => {
     expect(live.filesHydrated).toBe(1);
     expect(live.bytesFetched).toBe(2048);
 
+    // Final stats keep the SDK's token counts but the cost stays estimated
+    // from public pricing — the SDK's total_cost_usd / costUSD (0.5) must
+    // never appear.
     const final = statsEvents[2].stats;
+    expect(final.estimated).toBe(true);
+    expect(final.costUsd).toBeCloseTo(expectedEstimate, 9);
+    expect(final.byModel["claude-sonnet-4-5"].costUsd).toBeCloseTo(expectedEstimate, 9);
     expect(final).toEqual({
       durationMs: 5000,
       apiDurationMs: 4000,
       numTurns: 3,
-      costUsd: 0.5,
-      estimated: false,
+      costUsd: final.costUsd,
+      estimated: true,
       totals: expectedTotals,
-      byModel: { "claude-sonnet-4-5": { ...expectedTotals, costUsd: 0.5 } },
+      byModel: {
+        "claude-sonnet-4-5": {
+          ...expectedTotals,
+          costUsd: final.byModel["claude-sonnet-4-5"].costUsd,
+        },
+      },
       filesHydrated: 1,
       bytesFetched: 2048,
       final: true,

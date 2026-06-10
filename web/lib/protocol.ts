@@ -41,11 +41,13 @@ export interface SessionStats {
   /** Number of agentic turns (final stats only). */
   numTurns?: number;
   /**
-   * Cost in USD. On live stats this is estimated from public token pricing
-   * (`estimated: true`); the final stats carry the SDK's authoritative cost.
+   * Cost in USD, always estimated from public token pricing (never the
+   * SDK's own cost figure). Undefined when no model in the session has a
+   * known price. Final stats estimate from the SDK's authoritative token
+   * counts.
    */
   costUsd?: number;
-  /** True when costUsd (total and per-model) is estimated from public pricing. */
+  /** Always true: costUsd (total and per-model) is estimated from public pricing. */
   estimated?: boolean;
   totals: TokenUsage;
   byModel: Record<string, TokenUsage & { costUsd?: number }>;
@@ -121,6 +123,7 @@ export type SessionEvent =
   | { type: "plan_decided"; approved: boolean }
   /** Live (and finally authoritative) duration/token/cost statistics. */
   | { type: "session_stats"; stats: SessionStats }
+  /** costUsd is estimated from public token pricing (see SessionStats). */
   | { type: "result"; subtype: string; result?: string; costUsd?: number; durationMs?: number }
   | { type: "session_done" }
   | { type: "error"; message: string };

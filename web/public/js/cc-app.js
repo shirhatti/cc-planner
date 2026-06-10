@@ -250,15 +250,13 @@ export class CcApp extends HTMLElement {
         if (msg.stats.final) this.persist(record);
         if (isActive) this.statsPanel.showSession(record);
         break;
-      case "result":
+      case "result": {
         if (msg.result) feed.addAssistant(msg.result);
-        if (msg.costUsd != null) {
-          record.costUsd = msg.costUsd;
-          feed.addInfo(
-            `Session finished (${(msg.durationMs / 1000).toFixed(1)}s, $${msg.costUsd.toFixed(4)})`,
-          );
-        }
+        const costNote = msg.costUsd != null ? `, ~$${msg.costUsd.toFixed(4)} est.` : "";
+        feed.addInfo(`Session finished (${(msg.durationMs / 1000).toFixed(1)}s${costNote})`);
+        record.costUsd = msg.costUsd;
         break;
+      }
       case "session_done":
         if (!this.isFinished(record)) this.updateStatus(msg.sessionId, "done");
         this.persist(record);

@@ -412,15 +412,23 @@ export class PlanSession {
         break;
       }
       case "result": {
+        // Final stats use the SDK's authoritative token counts, but cost is
+        // always estimated from public pricing — the SDK's own cost figure
+        // is never shown.
         const byModel: SessionStats["byModel"] = {};
+        let estimatedTotal: number | undefined;
         for (const [model, usage] of Object.entries(msg.modelUsage ?? {})) {
-          byModel[model] = {
+          const tokens: TokenUsage = {
             inputTokens: usage.inputTokens,
             outputTokens: usage.outputTokens,
             cacheReadTokens: usage.cacheReadInputTokens,
             cacheCreationTokens: usage.cacheCreationInputTokens,
-            costUsd: usage.costUSD,
           };
+          const costUsd = estimateModelCostUsd(model, tokens);
+          byModel[model] = { ...tokens, costUsd };
+          if (costUsd !== undefined) {
+            estimatedTotal = (estimatedTotal ?? 0) + costUsd;
+          }
         }
         this.send({
           type: "session_stats",
@@ -428,8 +436,8 @@ export class PlanSession {
             durationMs: msg.duration_ms,
             apiDurationMs: msg.duration_api_ms,
             numTurns: msg.num_turns,
-            costUsd: msg.total_cost_usd,
-            estimated: false,
+            costUsd: estimatedTotal,
+            estimated: true,
             totals: usageFromRaw(msg.usage as RawUsage | undefined),
             byModel,
             filesHydrated: this.filesHydrated,
@@ -441,7 +449,7 @@ export class PlanSession {
           type: "result",
           subtype: msg.subtype,
           result: msg.subtype === "success" ? msg.result : undefined,
-          costUsd: msg.total_cost_usd,
+          costUsd: estimatedTotal,
           durationMs: msg.duration_ms,
         });
         break;
