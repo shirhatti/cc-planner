@@ -17,4 +17,21 @@ export default tseslint.config(
       "@typescript-eslint/no-require-imports": "off",
     },
   },
+  {
+    files: ["web/public/**/*.js"],
+    languageOptions: {
+      globals: {
+        document: "readonly",
+        window: "readonly",
+        location: "readonly",
+        localStorage: "readonly",
+        WebSocket: "readonly",
+        HTMLElement: "readonly",
+        CustomEvent: "readonly",
+        customElements: "readonly",
+        crypto: "readonly",
+        setTimeout: "readonly",
+      },
+    },
+  },
 );
