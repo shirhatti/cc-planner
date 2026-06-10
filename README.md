@@ -5,7 +5,7 @@ Two complementary Virtual File Systems (VFS) for Claude Code's Plan Mode, both i
 1. **Virtual plan files** (`preload/vfs-virtual.ts`) — plan files are kept entirely in memory and never touch disk, allowing real-time streaming of plan content via IPC.
 2. **Hydrating repo files** (`preload/vfs-hydrate.ts`) — Claude Code can plan against a repo cloned with `--filter=blob:none --no-checkout` (no file contents downloaded). Files are hydrated on demand via the `gh` CLI the first time Claude reads them, so **a fully cloned repo is never needed**.
 
-On top of this infra, `web/` provides a **browser app for plan-mode sessions** — see [Web App](#web-app).
+On top of this infra, `web/` provides a **general browser client for Claude Code** — multi-turn sessions, browser-side permissions, diffs, plan review — see [Web TTY](#web-tty).
 
 ## Overview
 
@@ -63,26 +63,31 @@ The suite covers both VFS layers:
 1. **Virtual VFS** - Plan files never touch disk; regular files pass through
 2. **Hydrating VFS** - Files in a blob-less clone are fetched on demand (tests run fully offline against a local fixture repo and a fake `gh`)
 
-## Web App
+## Web TTY
 
-`web/` is a browser UI for running plan-mode sessions on top of the VFS infra:
+`web/` is a general browser client for Claude Code — a TTY with niceties. It's decoupled from the planner: sessions are multi-turn, run in any permission mode, and every interactive tool call is handled in the browser. The cc-planner VFS infra provides its repo workspaces.
 
 ```bash
-bun run start          # serves http://localhost:3000 (PORT to override)
+bun run build          # build the UI (Vite)
+bun run start          # serve http://localhost:3000 (PORT to override)
+
+# development: Bun server + Vite dev server (HMR, proxies /ws to :3000)
+bun run start & bun run dev:ui
 ```
 
 **Features**
 
-- **Multiple concurrent sessions** — a sidebar lists every planning session; sessions run in parallel, each in its own claude process, multiplexed over one WebSocket.
-- **Live plan streaming** — the plan panel renders the plan markdown in real time as Claude writes it, via the plan-file VFS IPC events.
-- **AskUserQuestion in the browser** — when Claude calls the `AskUserQuestion` tool, the question card (header chips, 2-4 options with descriptions, multi-select, free-text "Other") renders inline in the session feed. Your selection is returned to the tool call through the SDK's `canUseTool` permission callback.
-- **Plan review** — when Claude calls `ExitPlanMode`, a review bar appears: **Approve plan** ends the session with the approved plan as the deliverable (the session is interrupted so Claude never starts implementing), **Request changes** denies the tool call with your feedback so Claude revises the plan and resubmits.
-- **Session stats** — a stats panel below the plan shows duration (ticking live), token usage by type (input / output / cache read / cache write) broken down per model, cost, turn count, and hydration volume (files hydrated, bytes fetched). Usage streams in as Claude works; the final token counts come from the SDK's authoritative result message.
-- **Real-time cost** — cost is always estimated from public Claude API token pricing (`web/lib/pricing.ts`, including cache-read at 0.1× and cache-write at 1.25× input rates) applied to the session's token usage, shown per model with a `~`/`(est.)` marker. The SDK's own cost figure is never displayed — live estimates cover turns observed so far, and the final estimate is computed from the SDK's authoritative token counts. Unknown model IDs (e.g. behind some gateways) simply show no estimate.
-- **localStorage persistence** — prompts, repo metadata, status, stats, and the latest plan of every session persist in the browser; restored sessions show their saved plan after a reload (live transcripts are not persisted).
-- **LLM gateway support** — the sidebar's _Gateway settings_ let you set an Anthropic base URL and bearer token (stored in the browser, sent per session). They become `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` in the child claude process, so traffic can route through a gateway such as LiteLLM. Leave empty to use the server's environment.
+- **Multi-turn sessions** — the first prompt starts the session; a composer sends follow-up messages (queued if a turn is running), `Stop turn` interrupts the current turn, and `End session` closes input so Claude finishes and exits. Multiple concurrent sessions multiplex over one WebSocket, each in its own claude process.
+- **Permission modes** — start a session in `plan`, `default`, or `acceptEdits`. Outside plan mode, every gated tool call (Bash, Edit, Write, ...) renders as an allow / always-allow / deny card in the browser via the SDK's `canUseTool` callback.
+- **Diff viewer** — Edit/Write tool activity and their permission cards render Shiki-highlighted unified diffs with [@pierre/diffs](https://diffs.com), so changes can be reviewed before they're allowed. Write diffs are computed against the current file on disk.
+- **AskUserQuestion in the browser** — question cards (header chips, 2-4 options with descriptions, multi-select, free-text "Other") render inline in the session feed.
+- **Plan mode + review** — the plan panel renders the plan markdown live as Claude writes it (via the plan-file VFS IPC events). When Claude calls `ExitPlanMode`, a review bar appears: approve or request changes with feedback. "End session when plan is approved" (on by default in plan mode) preserves the classic planner workflow; turn it off and approval lets Claude continue into implementation under browser-prompted permissions.
+- **Session stats** — duration (ticking live), token usage by type and per model, turn count, and hydration volume. Cost is always **estimated from public Claude API token pricing** (`web/lib/pricing.ts`) and marked `~`/`(est.)`; the SDK's own cost figure is never displayed.
+- **localStorage persistence** — prompts, repo metadata, status, stats, and the latest plan of every session persist in the browser (live transcripts are not persisted across reloads).
+- **LLM gateway support** — set an Anthropic base URL and bearer token in the sidebar; they become `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` in the child claude process.
+- **PWA** — installable, with a web manifest and an auto-updating service worker (app shell precached, hashed assets cached on demand).
 
-The frontend is vanilla JavaScript organized as Web Components (`web/public/js/components/`) — no build step.
+The frontend is TypeScript Web Components built with Vite (`web/src/`), typed against the shared WebSocket protocol (`web/lib/protocol.ts`).
 
 ### Repo modes
 
@@ -113,11 +118,12 @@ For a private repo at build time, pass `--build-arg BAKE_TOKEN=$(gh auth token)`
 ### Web architecture
 
 ```
-browser (Web Components)  ←WebSocket→  web/server.ts (Bun.serve)
-  cc-app / cc-feed / cc-plan-panel       PlanSession (web/lib/session.ts)
-  cc-question-card / cc-session-list       ├─ canUseTool → ask_user_question / plan_review round-trips
-  cc-settings-panel (localStorage)         ├─ planRemoteRepo() — lazy hydration mode
-                                           └─ planBakedRepo()  — baked mode
+browser (Vite + TS Web Components)  ←WebSocket→  web/server.ts (Bun.serve, serves web/dist)
+  cc-app / cc-feed / cc-composer                   ClaudeSession (web/lib/session.ts)
+  cc-plan-panel / cc-question-card                   ├─ InputQueue → SDK streaming input (multi-turn)
+  cc-diff (@pierre/diffs) / cc-stats-panel           ├─ canUseTool → question / plan review / permission cards
+  cc-session-list / cc-settings-panel                ├─ planRemoteRepo() — lazy hydration workspace
+                                                     └─ planBakedRepo()  — baked workspace
 ```
 
 Every session-scoped WebSocket message carries a client-generated `sessionId` (`web/lib/protocol.ts`), which is how one socket multiplexes many sessions.
@@ -423,36 +429,40 @@ Sent when a `gh api` fetch fails (the read then throws `EIO`).
 cc-planner/
 ├── package.json
 ├── tsconfig.json
+├── vite.config.ts              # Vite build + dev server (PWA plugin, /ws proxy)
 ├── README.md
-├── Dockerfile                  # Web app image; BAKE_REPO arg bakes a repo in
+├── Dockerfile                  # Web TTY image; BAKE_REPO arg bakes a repo in
 ├── preload/
 │   ├── vfs-virtual.ts          # In-memory VFS for plan files
 │   └── vfs-hydrate.ts          # On-demand hydration over blob-less clones
 ├── scripts/
 │   ├── sdk-example.ts          # Runnable SDK example (sandbox-safe)
 │   ├── plan-remote-repo.ts     # Plan against a repo without cloning it
+│   ├── generate-icons.ts       # Regenerates the PWA icons (no image deps)
 │   ├── lib/
-│   │   ├── plan-remote.ts      # planRemoteRepo() high-level API
-│   │   ├── plan-baked.ts       # planBakedRepo() for baked-in checkouts
+│   │   ├── plan-remote.ts      # planRemoteRepo() — lazy-hydration sessions
+│   │   ├── plan-baked.ts       # planBakedRepo() — baked-checkout sessions
 │   │   ├── blobless-clone.ts   # Internal: blob-less clone helper
 │   │   ├── child-env.ts        # Internal: sandbox auth env fixups
 │   │   └── spawn-vfs.ts        # Internal: SDK spawn fn with preloads
 │   ├── vfs-virtual.test.ts     # Bun test suite (plan-file VFS)
 │   └── vfs-hydrate.test.ts     # Bun test suite (hydrating VFS, offline)
 └── web/
-    ├── server.ts               # Bun HTTP + WebSocket server
+    ├── server.ts               # Bun HTTP + WebSocket server (serves dist/)
+    ├── index.html              # Vite entry
     ├── lib/
     │   ├── protocol.ts         # Browser <-> server message types
-    │   └── session.ts          # PlanSession: SDK <-> browser bridge
+    │   ├── pricing.ts          # Public token pricing for cost estimates
+    │   └── session.ts          # ClaudeSession: SDK <-> browser bridge
     ├── session.test.ts         # Bun test suite (session bridge, offline)
-    └── public/                 # Web Components UI (no build step)
-        ├── index.html
-        ├── style.css
-        └── js/
-            ├── cc-app.js       # Root component: WS + session orchestration
-            ├── store.js        # localStorage persistence
-            ├── markdown.js     # Minimal safe markdown renderer
-            └── components/     # cc-feed, cc-plan-panel, cc-question-card,
+    ├── public/                 # Static assets (PWA icons)
+    └── src/                    # TypeScript Web Components (Vite)
+        ├── main.ts             # Entry: styles, components, SW registration
+        ├── store.ts            # localStorage persistence
+        ├── markdown.ts         # Minimal safe markdown renderer
+        ├── styles.css
+        └── components/         # cc-app, cc-feed, cc-composer, cc-diff,
+                                # cc-plan-panel, cc-question-card, cc-stats-panel,
                                 # cc-session-list, cc-start-form, cc-settings-panel
 ```
 
