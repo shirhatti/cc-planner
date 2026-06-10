@@ -1,6 +1,9 @@
 # Virtual File System for Claude Code Plan Mode
 
-A complete in-memory Virtual File System (VFS) for Claude Code's Plan Mode. Plan files are kept entirely in memory and never touch disk, allowing real-time streaming of plan content via IPC.
+Two complementary Virtual File Systems (VFS) for Claude Code's Plan Mode, both injected via Bun's `--preload`:
+
+1. **Virtual plan files** (`preload/vfs-virtual.ts`) — plan files are kept entirely in memory and never touch disk, allowing real-time streaming of plan content via IPC.
+2. **Hydrating repo files** (`preload/vfs-hydrate.ts`) — Claude Code can plan against a repo cloned with `--filter=blob:none --no-checkout` (no file contents downloaded). Files are hydrated on demand via the `gh` CLI the first time Claude reads them, so **a fully cloned repo is never needed**.
 
 ## Overview
 
@@ -10,6 +13,8 @@ When Claude Code operates in Plan Mode, it writes plan files to `~/.claude/plans
 
 - 📁 **Complete Virtualization** - Plan files never touch disk
 - 🚀 **Real-time Streaming** - Stream plan content via IPC as it's written
+- 🪶 **Blob-less Clones** - Plan against any GitHub repo without downloading its contents
+- 💧 **On-demand Hydration** - Repo files are fetched via `gh api` only when Claude reads them
 - 🔍 **Full Transparency** - All other filesystem paths work normally
 - ⚡ **Zero Overhead** - Uses Bun's `--preload` for early injection
 
@@ -51,10 +56,10 @@ bun install
 bun test
 ```
 
-This runs two tests:
+The suite covers both VFS layers:
 
-1. **Virtual VFS Test** - Verifies plan files never touch disk
-2. **Passthrough Test** - Verifies regular files work normally
+1. **Virtual VFS** - Plan files never touch disk; regular files pass through
+2. **Hydrating VFS** - Files in a blob-less clone are fetched on demand (tests run fully offline against a local fixture repo and a fake `gh`)
 
 ## Usage Example
 
@@ -123,6 +128,66 @@ for await (const msg of session) {
 }
 ```
 
+## Planning Without a Full Clone (Hydrating VFS)
+
+cc-planner does not need a fully cloned repo to work. `planRemoteRepo()` runs a plan-mode session against any GitHub repo using only its commit/tree metadata:
+
+```typescript
+import { planRemoteRepo } from "./scripts/lib/plan-remote";
+
+const { session } = planRemoteRepo({
+  repo: "owner/repo",
+  prompt: "Create a plan for adding rate limiting to the API",
+  onPlan: (content) => console.log(content),
+});
+
+for await (const msg of session) {
+  // assistant / result messages, same as a normal SDK session
+}
+```
+
+Or from the command line:
+
+```bash
+bun run scripts/plan-remote-repo.ts owner/repo "Create a plan for adding rate limiting"
+```
+
+### How It Works
+
+The blob-less clone is an internal implementation detail — you never interact with it directly:
+
+1. `planRemoteRepo()` clones the repo into a temp directory with `git clone --filter=blob:none --no-checkout`. This downloads commits and trees but **zero file contents**, and leaves the working tree empty. For a large repo this is a few hundred KB instead of hundreds of MB.
+2. The child claude process is started with `preload/vfs-hydrate.ts`, which builds a manifest of every file in the tree from `git ls-tree` (purely local — trees are always present in a blob-less clone).
+3. Directory listings (`readdir`), existence checks (`existsSync`), and path stats are answered from the manifest with **no network access**, so Claude sees the full repo structure immediately.
+4. The first time Claude actually reads a file (`readFileSync`, `fs.promises.readFile`, `open`, ...), the preload fetches it with `gh api repos/<owner>/<repo>/contents/<path>?ref=<sha>` (raw media type), writes it to disk, and the read proceeds normally.
+5. Hydrated files live on disk, so subsequent access — including from subprocesses like `rg` or `cat` spawned by Bash tools — works without interception. Files Claude writes or deletes behave like a normal filesystem.
+
+Authentication for private repos is delegated entirely to the `gh` CLI (`gh auth login`), both for the initial clone (via `gh auth git-credential`) and for content fetches (via `gh api`).
+
+### Hydration Strategies
+
+Two fetch strategies are supported; `planRemoteRepo()` picks automatically:
+
+- **`gh`** (default when the gh CLI is available) — fetches file contents through the GitHub contents API. Requires `gh` on PATH and network access to `api.github.com`.
+- **`git`** — exploits the fact that a blob-less clone is a _promisor_ clone: `git cat-file blob <ref>:<path>` makes git lazily fetch exactly that blob from origin, reusing whatever credentials or proxy the clone itself used. No gh CLI needed; works anywhere the clone worked (e.g., sandboxes that proxy git traffic but block `api.github.com`).
+
+### Configuration
+
+`preload/vfs-hydrate.ts` is configured via env vars (set automatically by `planRemoteRepo()`):
+
+| Variable              | Required | Description                                                   |
+| --------------------- | -------- | ------------------------------------------------------------- |
+| `CC_HYDRATE_ROOT`     | yes      | Path of the blob-less working tree. Unset = preload is inert. |
+| `CC_HYDRATE_REPO`     | no       | `owner/repo`; defaults to parsing the `origin` remote URL.    |
+| `CC_HYDRATE_REF`      | no       | Commit to hydrate from; defaults to `HEAD`'s sha.             |
+| `CC_HYDRATE_STRATEGY` | no       | `gh` (contents API, default) or `git` (promisor lazy fetch).  |
+
+### Limitations
+
+- Content searches that spawn subprocesses (ripgrep, grep) only see files that have already been hydrated. Plan-mode exploration driven by Read/Glob/LS works fully.
+- Symlinks and submodules in the tree are not hydrated.
+- Hydration is synchronous (blocking `gh` call) per first read of each file.
+
 ## Running Inside a Claude Code Sandbox
 
 When you use the SDK inside a Claude Code remote session (e.g., `claude.ai/code`), the child `claude` process inherits environment variables that reference **parent-only file descriptors** — pipes that can't be inherited. The child crashes immediately trying to read from a non-existent FD.
@@ -148,6 +213,14 @@ The example at `scripts/sdk-example.ts` demonstrates this with a `buildChildEnv(
 
 ```bash
 bun run scripts/sdk-example.ts
+```
+
+### GitHub Access Inside the Sandbox
+
+Sandboxes typically have no `gh` CLI and block `api.github.com` at the egress proxy, while still allowing git traffic to `github.com` (and/or routing it through a local credential-injecting proxy for the session's authorized repos). The hydrating VFS handles this automatically: `planRemoteRepo()` detects that `gh` is unavailable and falls back to the `git` hydration strategy, which fetches blobs through the same channel the blob-less clone used. No extra GitHub auth setup is needed:
+
+```bash
+bun run scripts/plan-remote-repo.ts owner/repo "Create a plan for ..."
 ```
 
 ## IPC Events
@@ -224,6 +297,50 @@ Sent when a virtual file is deleted.
 }
 ```
 
+### `hydrate_init`
+
+Sent when the hydrating VFS initializes over a blob-less clone.
+
+```typescript
+{
+  type: "hydrate_init",
+  mode: "hydrate",
+  root: "/tmp/cc-planner-abc123",
+  repo: "owner/repo",
+  ref: "0123abcd...",
+  files: 1234,
+  timestamp: 1234567890
+}
+```
+
+### `hydrate_fetch`
+
+Sent when a file is hydrated from GitHub on first read.
+
+```typescript
+{
+  type: "hydrate_fetch",
+  path: "/tmp/cc-planner-abc123/src/index.ts",
+  rel: "src/index.ts",
+  size: 2048,
+  timestamp: 1234567890
+}
+```
+
+### `hydrate_error`
+
+Sent when a `gh api` fetch fails (the read then throws `EIO`).
+
+```typescript
+{
+  type: "hydrate_error",
+  path: "/tmp/cc-planner-abc123/src/index.ts",
+  rel: "src/index.ts",
+  error: "HTTP 404 ...",
+  timestamp: 1234567890
+}
+```
+
 ## Project Structure
 
 ```
@@ -232,10 +349,18 @@ cc-planner/
 ├── tsconfig.json
 ├── README.md
 ├── preload/
-│   └── vfs-virtual.ts          # Virtual filesystem implementation
+│   ├── vfs-virtual.ts          # In-memory VFS for plan files
+│   └── vfs-hydrate.ts          # On-demand hydration over blob-less clones
 └── scripts/
     ├── sdk-example.ts          # Runnable SDK example (sandbox-safe)
-    └── vfs-virtual.test.ts     # Bun test suite
+    ├── plan-remote-repo.ts     # Plan against a repo without cloning it
+    ├── lib/
+    │   ├── plan-remote.ts      # planRemoteRepo() high-level API
+    │   ├── blobless-clone.ts   # Internal: blob-less clone helper
+    │   ├── child-env.ts        # Internal: sandbox auth env fixups
+    │   └── spawn-vfs.ts        # Internal: SDK spawn fn with preloads
+    ├── vfs-virtual.test.ts     # Bun test suite (plan-file VFS)
+    └── vfs-hydrate.test.ts     # Bun test suite (hydrating VFS, offline)
 ```
 
 ## Implementation Details
@@ -325,16 +450,7 @@ The tests verify:
 
 1. **Virtual VFS** - Plan files in `~/.claude/plans/` are completely virtualized and never touch disk
 2. **Passthrough** - Regular files outside `~/.claude/plans/` work normally and are written to disk
-
-Expected output:
-
-```
-bun test v1.3.3
- 2 pass
- 0 fail
- 11 expect() calls
-Ran 2 tests across 1 file. [339.00ms]
-```
+3. **Hydrating VFS** - Blob-less clones list their full tree without network access, hydrate file contents on first read (exactly one `gh` call per file), preserve executable bits, tombstone deletions, and compose with the plan-file VFS. These tests run fully offline against a local fixture repo and a fake `gh` binary.
 
 ## Use Cases
 

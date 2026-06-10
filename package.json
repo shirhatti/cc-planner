@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "test": "bun test scripts/vfs-virtual.test.ts",
+    "test": "bun test",
     "lint": "eslint preload/ scripts/",
     "lint:fix": "eslint --fix preload/ scripts/",
     "format": "prettier --write preload/ scripts/",
