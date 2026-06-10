@@ -77,11 +77,12 @@ export class CcStatsPanel extends HTMLElement {
     const live = !stats.final && LIVE_STATUSES.includes(record.status);
     const durationMs = live && record.startedAt ? Date.now() - record.startedAt : stats.durationMs;
 
+    const cost = (value) => `${stats.estimated ? "~" : ""}$${value.toFixed(4)}`;
     const summary = [
       formatDuration(durationMs),
       `${formatTokens(stats.totals.inputTokens + stats.totals.outputTokens)} tokens`,
     ];
-    if (stats.costUsd != null) summary.push(`$${stats.costUsd.toFixed(4)}`);
+    if (stats.costUsd != null) summary.push(cost(stats.costUsd));
     if (!stats.final) summary.push("live");
     this.querySelector(".stats-summary").textContent = summary.join(" · ");
 
@@ -89,7 +90,9 @@ export class CcStatsPanel extends HTMLElement {
       ["Duration", formatDuration(durationMs), "stat-duration"],
       ...(stats.apiDurationMs != null ? [["API time", formatDuration(stats.apiDurationMs)]] : []),
       ...(stats.numTurns != null ? [["Turns", String(stats.numTurns)]] : []),
-      ...(stats.costUsd != null ? [["Cost", `$${stats.costUsd.toFixed(4)}`]] : []),
+      ...(stats.costUsd != null
+        ? [[stats.estimated ? "Cost (est.)" : "Cost", cost(stats.costUsd)]]
+        : []),
       ["Input", formatTokens(stats.totals.inputTokens)],
       ["Output", formatTokens(stats.totals.outputTokens)],
       ["Cache read", formatTokens(stats.totals.cacheReadTokens)],
@@ -127,7 +130,7 @@ export class CcStatsPanel extends HTMLElement {
         formatTokens(usage.outputTokens),
         formatTokens(usage.cacheReadTokens),
         formatTokens(usage.cacheCreationTokens),
-        usage.costUsd != null ? `$${usage.costUsd.toFixed(4)}` : "—",
+        usage.costUsd != null ? cost(usage.costUsd) : "—",
       ];
       for (const value of values) {
         const td = document.createElement("td");

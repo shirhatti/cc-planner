@@ -40,8 +40,13 @@ export interface SessionStats {
   apiDurationMs?: number;
   /** Number of agentic turns (final stats only). */
   numTurns?: number;
-  /** Total cost in USD (final stats only). */
+  /**
+   * Cost in USD. On live stats this is estimated from public token pricing
+   * (`estimated: true`); the final stats carry the SDK's authoritative cost.
+   */
   costUsd?: number;
+  /** True when costUsd (total and per-model) is estimated from public pricing. */
+  estimated?: boolean;
   totals: TokenUsage;
   byModel: Record<string, TokenUsage & { costUsd?: number }>;
   /** Repo files hydrated on demand (lazy hydration mode only). */

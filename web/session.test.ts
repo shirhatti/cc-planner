@@ -8,6 +8,7 @@ import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 import type { PermissionResult, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { estimateModelCostUsd, priceForModel } from "./lib/pricing";
 import type { SessionEvent } from "./lib/protocol";
 import {
   gatewayEnv,
@@ -82,6 +83,36 @@ describe("summarizeToolInput", () => {
   test("truncates long values", () => {
     const long = "x".repeat(200);
     expect(summarizeToolInput({ command: long })).toHaveLength(120);
+  });
+});
+
+describe("pricing", () => {
+  test("matches date-suffixed model IDs by longest prefix", () => {
+    // claude-opus-4-8 must not fall through to the claude-opus-4 (4.0) rates
+    expect(priceForModel("claude-opus-4-8")?.inputPerMTok).toBe(5);
+    expect(priceForModel("claude-opus-4-20250514")?.inputPerMTok).toBe(15);
+    expect(priceForModel("claude-sonnet-4-5-20250929")?.outputPerMTok).toBe(15);
+    expect(priceForModel("claude-haiku-4-5-20251001")?.cacheReadPerMTok).toBeCloseTo(0.1);
+    expect(priceForModel("some-gateway-model")).toBeUndefined();
+  });
+
+  test("estimates cost across token types", () => {
+    // Sonnet 4.5: $3 in, $15 out, $0.30 cache read, $3.75 cache write per MTok
+    const cost = estimateModelCostUsd("claude-sonnet-4-5-20250929", {
+      inputTokens: 1_000_000,
+      outputTokens: 1_000_000,
+      cacheReadTokens: 1_000_000,
+      cacheCreationTokens: 1_000_000,
+    });
+    expect(cost).toBeCloseTo(3 + 15 + 0.3 + 3.75);
+    expect(
+      estimateModelCostUsd("some-gateway-model", {
+        inputTokens: 1,
+        outputTokens: 1,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+      }),
+    ).toBeUndefined();
   });
 });
 
@@ -364,8 +395,16 @@ describe("PlanSession", () => {
 
     const live = statsEvents[1].stats;
     expect(live.final).toBe(false);
+    expect(live.estimated).toBe(true);
     expect(live.totals).toEqual(expectedTotals);
-    expect(live.byModel["claude-sonnet-4-5"]).toEqual(expectedTotals);
+    // Sonnet 4.5 estimate: (10*$3 + 20*$15 + 30*$0.30 + 40*$3.75) / 1M
+    const expectedEstimate = (10 * 3 + 20 * 15 + 30 * 0.3 + 40 * 3.75) / 1e6;
+    expect(live.costUsd).toBeCloseTo(expectedEstimate, 9);
+    expect(live.byModel["claude-sonnet-4-5"]).toEqual({
+      ...expectedTotals,
+      costUsd: live.byModel["claude-sonnet-4-5"].costUsd,
+    });
+    expect(live.byModel["claude-sonnet-4-5"].costUsd).toBeCloseTo(expectedEstimate, 9);
     expect(live.filesHydrated).toBe(1);
     expect(live.bytesFetched).toBe(2048);
 
@@ -375,12 +414,49 @@ describe("PlanSession", () => {
       apiDurationMs: 4000,
       numTurns: 3,
       costUsd: 0.5,
+      estimated: false,
       totals: expectedTotals,
       byModel: { "claude-sonnet-4-5": { ...expectedTotals, costUsd: 0.5 } },
       filesHydrated: 1,
       bytesFetched: 2048,
       final: true,
     });
+  });
+
+  test("repeated usage from the same API call is not double counted", async () => {
+    const sent: SessionEvent[] = [];
+    const usage = {
+      input_tokens: 5,
+      output_tokens: 5,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    };
+    // The SDK emits one assistant message per content block, all sharing the
+    // API call's message id and usage — msg_1 must be counted once.
+    const runner = fakeRunner(async function* () {
+      for (const id of ["msg_1", "msg_1", "msg_2"]) {
+        yield {
+          type: "assistant",
+          message: { id, model: "claude-haiku-4-5-20251001", usage, content: [] },
+        } as unknown as SDKMessage;
+      }
+    });
+    const session = new PlanSession((msg) => sent.push(msg), runner);
+    await session.start({ prompt: "p" });
+
+    const last = sent
+      .filter(
+        (m): m is Extract<SessionEvent, { type: "session_stats" }> => m.type === "session_stats",
+      )
+      .at(-1);
+    expect(last?.stats.totals).toEqual({
+      inputTokens: 10,
+      outputTokens: 10,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+    });
+    // Haiku 4.5: (10*$1 + 10*$5) / 1M
+    expect(last?.stats.costUsd).toBeCloseTo(60 / 1e6, 9);
   });
 
   test("gateway auth is passed to the runner env", async () => {

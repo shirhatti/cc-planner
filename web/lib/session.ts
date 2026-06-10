@@ -16,6 +16,7 @@ import type { CanUseTool, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { planBakedRepo, resolveBakedRef } from "../../scripts/lib/plan-baked";
 import { planRemoteRepo } from "../../scripts/lib/plan-remote";
 import type { VfsMessage } from "../../scripts/lib/spawn-vfs";
+import { estimateModelCostUsd } from "./pricing";
 import type {
   AuthConfig,
   ClientMessage,
@@ -167,8 +168,13 @@ export class PlanSession {
   private started = false;
   private planApproved = false;
   private startedAt = 0;
-  private readonly liveTotals = emptyUsage();
-  private readonly liveByModel = new Map<string, TokenUsage>();
+  /**
+   * Usage per API call, keyed by message id. The SDK can emit several
+   * assistant messages for one API call (one per content block), each
+   * repeating the same usage — keeping the latest snapshot per id avoids
+   * double counting.
+   */
+  private readonly liveUsageByMessage = new Map<string, { model: string; usage: TokenUsage }>();
   private filesHydrated = 0;
   private bytesFetched = 0;
 
@@ -343,14 +349,32 @@ export class PlanSession {
   }
 
   private sendLiveStats(): void {
+    const usageByModel = new Map<string, TokenUsage>();
+    const totals = emptyUsage();
+    for (const { model, usage } of this.liveUsageByMessage.values()) {
+      const modelUsage = usageByModel.get(model) ?? emptyUsage();
+      addUsage(modelUsage, usage);
+      usageByModel.set(model, modelUsage);
+      addUsage(totals, usage);
+    }
+
+    const byModel: SessionStats["byModel"] = {};
+    let estimatedTotal: number | undefined;
+    for (const [model, usage] of usageByModel) {
+      const costUsd = estimateModelCostUsd(model, usage);
+      byModel[model] = { ...usage, costUsd };
+      if (costUsd !== undefined) {
+        estimatedTotal = (estimatedTotal ?? 0) + costUsd;
+      }
+    }
     this.send({
       type: "session_stats",
       stats: {
         durationMs: Date.now() - this.startedAt,
-        totals: { ...this.liveTotals },
-        byModel: Object.fromEntries(
-          [...this.liveByModel].map(([model, usage]) => [model, { ...usage }]),
-        ),
+        costUsd: estimatedTotal,
+        estimated: true,
+        totals,
+        byModel,
         filesHydrated: this.filesHydrated,
         bytesFetched: this.bytesFetched,
         final: false,
@@ -379,12 +403,10 @@ export class PlanSession {
         }
         const usage = msg.message.usage as RawUsage | undefined;
         if (usage) {
-          const delta = usageFromRaw(usage);
-          addUsage(this.liveTotals, delta);
-          const model = msg.message.model ?? "unknown";
-          const modelUsage = this.liveByModel.get(model) ?? emptyUsage();
-          addUsage(modelUsage, delta);
-          this.liveByModel.set(model, modelUsage);
+          this.liveUsageByMessage.set(msg.message.id ?? `turn-${this.liveUsageByMessage.size}`, {
+            model: msg.message.model ?? "unknown",
+            usage: usageFromRaw(usage),
+          });
           this.sendLiveStats();
         }
         break;
@@ -407,6 +429,7 @@ export class PlanSession {
             apiDurationMs: msg.duration_api_ms,
             numTurns: msg.num_turns,
             costUsd: msg.total_cost_usd,
+            estimated: false,
             totals: usageFromRaw(msg.usage as RawUsage | undefined),
             byModel,
             filesHydrated: this.filesHydrated,
