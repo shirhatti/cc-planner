@@ -305,6 +305,9 @@ export class CcApp extends HTMLElement {
           msg.approved && record.stopOnPlanApproval ? "approved" : "running",
         );
         break;
+      case "notice":
+        feed.addInfo(msg.text);
+        break;
       case "session_stats":
         record.stats = msg.stats;
         if (msg.stats.final) this.persist(record);

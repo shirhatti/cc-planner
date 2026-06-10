@@ -26,6 +26,7 @@ import type {
 import { planBakedRepo, resolveBakedRef } from "../../scripts/lib/plan-baked";
 import { planRemoteRepo } from "../../scripts/lib/plan-remote";
 import type { VfsMessage } from "../../scripts/lib/spawn-vfs";
+import { evaluateBashCommand, HYDRATION_GUIDANCE } from "./bash-policy";
 import { estimateModelCostUsd } from "./pricing";
 import type {
   AuthConfig,
@@ -119,6 +120,7 @@ export class InputQueue implements AsyncIterable<SDKUserMessage> {
 export interface RunnerArgs {
   prompt: string | AsyncIterable<SDKUserMessage>;
   permissionMode?: PermissionMode;
+  appendSystemPrompt?: string;
   repo?: string;
   branch?: string;
   canUseTool: CanUseTool;
@@ -269,6 +271,14 @@ export interface StartRequest {
   auth?: AuthConfig;
 }
 
+export interface ClaudeSessionOptions {
+  /**
+   * The workspace is a lazily-hydrated (blob-less) clone: apply the Bash
+   * command policy and append the hydration guidance to the system prompt.
+   */
+  hydratingWorkspace?: boolean;
+}
+
 export class ClaudeSession {
   private readonly pending = new Map<string, PendingRequest>();
   private readonly abort = new AbortController();
@@ -291,6 +301,7 @@ export class ClaudeSession {
   constructor(
     private readonly send: (msg: SessionEvent) => void,
     private readonly runner: SessionRunner,
+    private readonly options: ClaudeSessionOptions = {},
   ) {}
 
   async start(req: StartRequest): Promise<void> {
@@ -309,6 +320,7 @@ export class ClaudeSession {
       const { session, repo, ref } = this.runner({
         prompt: this.input,
         permissionMode: mode,
+        appendSystemPrompt: this.options.hydratingWorkspace ? HYDRATION_GUIDANCE : undefined,
         repo: req.repo,
         branch: req.branch,
         extraEnv: gatewayEnv(req.auth),
@@ -415,6 +427,22 @@ export class ClaudeSession {
         return { behavior: "allow", updatedInput: input };
       }
       return { behavior: "deny", message: decision?.feedback?.trim() || REJECTION_FALLBACK };
+    }
+
+    // On lazily-hydrated workspaces, gate Bash commands that walk the tree
+    // or read files outside the VFS — deny them with guidance toward the
+    // VFS-optimal tools, and auto-allow known-safe metadata commands.
+    if (toolName === "Bash" && this.options.hydratingWorkspace) {
+      const command = typeof input.command === "string" ? input.command : "";
+      const policy = evaluateBashCommand(command);
+      if (policy.verdict === "deny") {
+        this.send({ type: "notice", text: `Blocked \`${command}\` — ${policy.reason}` });
+        return { behavior: "deny", message: policy.reason ?? "Command blocked by VFS policy." };
+      }
+      if (policy.verdict === "allow") {
+        return { behavior: "allow", updatedInput: input };
+      }
+      // "ask" falls through to the normal permission card.
     }
 
     // Every other gated tool (Bash, Edit, Write, ...) becomes an allow/deny

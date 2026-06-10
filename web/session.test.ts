@@ -362,6 +362,84 @@ describe("ClaudeSession", () => {
     expect(results[2]).toEqual({ behavior: "deny", message: "The user denied this tool call." });
   });
 
+  test("hydrating workspaces enforce the Bash policy and append guidance", async () => {
+    const sent: SessionEvent[] = [];
+    const results: PermissionResult[] = [];
+    let appendedPrompt: string | undefined;
+
+    const runner: SessionRunner = (args) => {
+      appendedPrompt = args.appendSystemPrompt;
+      const gen = (async function* () {
+        // Tree walker: auto-denied with guidance, no browser round-trip.
+        results.push(
+          await args.canUseTool("Bash", { command: "find . -name x" }, toolOptions("b1")),
+        );
+        // Safe metadata command: auto-allowed, no browser round-trip.
+        results.push(
+          await args.canUseTool("Bash", { command: "git log --oneline" }, toolOptions("b2")),
+        );
+        // Anything else: normal permission card.
+        results.push(await args.canUseTool("Bash", { command: "bun test" }, toolOptions("b3")));
+        yield* [] as SDKMessage[];
+      })() as RunnerResult["session"];
+      return { session: gen, repo: "owner/repo", ref: "abc123def456" };
+    };
+
+    const session: ClaudeSession = new ClaudeSession(
+      (msg) => {
+        sent.push(msg);
+        if (msg.type === "permission_request") {
+          expect(msg.id).toBe("b3");
+          session.handleClientMessage({
+            type: "permission_decision",
+            sessionId: "s1",
+            id: msg.id,
+            allow: true,
+          });
+        }
+      },
+      runner,
+      { hydratingWorkspace: true },
+    );
+
+    await session.start({ prompt: "p" });
+
+    expect(appendedPrompt).toContain("blob-less git clone");
+    expect(results[0].behavior).toBe("deny");
+    expect(results[0]).toMatchObject({ behavior: "deny" });
+    expect(sent.some((m) => m.type === "notice" && m.text.includes("find"))).toBe(true);
+    expect(results[1]).toEqual({
+      behavior: "allow",
+      updatedInput: { command: "git log --oneline" },
+    });
+    expect(results[2].behavior).toBe("allow");
+    // Only the "ask" command produced a permission card.
+    expect(sent.filter((m) => m.type === "permission_request")).toHaveLength(1);
+  });
+
+  test("non-hydrating workspaces skip the Bash policy", async () => {
+    const sent: SessionEvent[] = [];
+    const runner = fakeRunner(async function* (args) {
+      await args.canUseTool("Bash", { command: "find . -name x" }, toolOptions("b4"));
+      yield* [] as SDKMessage[];
+    });
+    const session: ClaudeSession = new ClaudeSession((msg) => {
+      sent.push(msg);
+      if (msg.type === "permission_request") {
+        session.handleClientMessage({
+          type: "permission_decision",
+          sessionId: "s1",
+          id: msg.id,
+          allow: true,
+        });
+      }
+    }, runner);
+    await session.start({ prompt: "p" });
+    // Baked workspaces: find is fine, goes through the normal permission flow.
+    expect(sent.filter((m) => m.type === "permission_request")).toHaveLength(1);
+    expect(sent.some((m) => m.type === "notice")).toBe(false);
+  });
+
   test("user messages stream into the session until end_session", async () => {
     const received: string[] = [];
     const runner: SessionRunner = (args) => {

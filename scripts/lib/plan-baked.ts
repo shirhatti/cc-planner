@@ -33,6 +33,8 @@ export interface BakedPlanOptions {
   prompt: string | AsyncIterable<SDKUserMessage>;
   /** Permission mode for the session. Defaults to "plan". */
   permissionMode?: PermissionMode;
+  /** Extra instructions appended to the standard Claude Code system prompt. */
+  appendSystemPrompt?: string;
   /** Called with the plan content whenever a plan file is finalized. */
   onPlan?: (content: string, filename: string) => void;
   /** Called for every VFS IPC message (vfs_write, plan_file_write, ...). */
@@ -80,6 +82,9 @@ export function planBakedRepo(options: BakedPlanOptions): BakedPlanSession {
     options: {
       env: { ...buildChildEnv(), ...options.extraEnv },
       permissionMode: options.permissionMode ?? "plan",
+      systemPrompt: options.appendSystemPrompt
+        ? { type: "preset", preset: "claude_code", append: options.appendSystemPrompt }
+        : undefined,
       executable: "bun",
       cwd: options.root,
       canUseTool: options.canUseTool,

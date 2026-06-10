@@ -39,6 +39,8 @@ export interface RemotePlanOptions {
   branch?: string;
   /** Permission mode for the session. Defaults to "plan". */
   permissionMode?: PermissionMode;
+  /** Extra instructions appended to the standard Claude Code system prompt. */
+  appendSystemPrompt?: string;
   /**
    * How file contents are fetched: "gh" uses the GitHub contents API,
    * "git" lazily fetches blobs from the promisor remote. Defaults to "gh"
@@ -91,6 +93,9 @@ export function planRemoteRepo(options: RemotePlanOptions): RemotePlanSession {
     options: {
       env: childEnv,
       permissionMode: options.permissionMode ?? "plan",
+      systemPrompt: options.appendSystemPrompt
+        ? { type: "preset", preset: "claude_code", append: options.appendSystemPrompt }
+        : undefined,
       executable: "bun",
       cwd: root,
       canUseTool: options.canUseTool,

@@ -93,7 +93,9 @@ const server = Bun.serve<SocketData, never>({
           sendTo(ws, { type: "error", sessionId, message: "Session already started" });
           return;
         }
-        const session = new ClaudeSession((event) => sendTo(ws, { ...event, sessionId }), runner);
+        const session = new ClaudeSession((event) => sendTo(ws, { ...event, sessionId }), runner, {
+          hydratingWorkspace: repoMode.mode === "lazy",
+        });
         ws.data.sessions.set(sessionId, session);
         void session
           .start({

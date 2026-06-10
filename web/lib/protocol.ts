@@ -156,6 +156,8 @@ export type SessionEvent =
       plan?: string;
     }
   | { type: "plan_decided"; approved: boolean }
+  /** Server-side note about the session (e.g. a Bash command auto-denied by policy). */
+  | { type: "notice"; text: string }
   /** Live (and per-turn authoritative) duration/token/cost statistics. */
   | { type: "session_stats"; stats: SessionStats }
   /**
