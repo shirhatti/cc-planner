@@ -63,6 +63,39 @@ The suite covers both VFS layers:
 1. **Virtual VFS** - Plan files never touch disk; regular files pass through
 2. **Hydrating VFS** - Files in a blob-less clone are fetched on demand (tests run fully offline against a local fixture repo and a fake `gh`)
 
+## Just the Claude Code CLI (no web app)
+
+The VFS layers are plain `bun --preload` scripts — they work with the regular Claude Code CLI too. To start an interactive (or `-p` print-mode) session against any GitHub repo without cloning it:
+
+```bash
+# Interactive plan-mode session against a repo you never clone
+bun run scripts/claude-vfs.ts owner/repo -- --permission-mode plan
+
+# Non-interactive
+bun run scripts/claude-vfs.ts owner/repo -- -p "Summarize the build system"
+
+# Pin a branch, force a hydration strategy
+bun run scripts/claude-vfs.ts owner/repo --branch dev --strategy git -- --permission-mode plan
+```
+
+The launcher makes a blob-less clone into a temp directory, configures `preload/vfs-hydrate.ts` via the `CC_HYDRATE_*` env vars, and runs the CLI inside that workspace. Everything after `--` is passed to `claude` verbatim. Your existing login and settings (`~/.claude`) apply as usual.
+
+Doing it by hand (e.g. to wire the preload into your own tooling):
+
+```bash
+git clone --filter=blob:none --no-checkout https://github.com/owner/repo.git /tmp/ws
+cd /tmp/ws
+CC_HYDRATE_ROOT=/tmp/ws \
+  bun --preload /path/to/cc-planner/preload/vfs-hydrate.ts \
+  /path/to/cc-planner/node_modules/@anthropic-ai/claude-agent-sdk/cli.js \
+  --permission-mode plan
+```
+
+Two things to know:
+
+- `--preload` only applies to a JS entrypoint, so this runs the `cli.js` vendored in `@anthropic-ai/claude-agent-sdk` (it _is_ Claude Code) rather than a native-installer `claude` binary.
+- The plain CLI doesn't get the web app's extras (plan streaming UI, Bash hydration policy, prompt-free read-only tools) — it's just Claude Code on a lazily-hydrated workspace. Directory listings come from the repo manifest; file contents are fetched on first Read. See [Configuration](#configuration) for the `CC_HYDRATE_*` knobs.
+
 ## Web TTY
 
 `web/` is a general browser client for Claude Code — a TTY with niceties. It's decoupled from the planner: sessions are multi-turn, run in any permission mode, and every interactive tool call is handled in the browser. The cc-planner VFS infra provides its repo workspaces.
