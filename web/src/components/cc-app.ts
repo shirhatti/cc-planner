@@ -173,7 +173,10 @@ export class CcApp extends HTMLElement {
     }
 
     Object.assign(record, {
-      repo: this.config.mode === "baked" ? (this.config.repo ?? "") : detail.repo,
+      repo:
+        detail.localPath ||
+        detail.repo ||
+        (this.config.mode === "baked" ? (this.config.repo ?? "") : ""),
       branch: detail.branch,
       prompt: detail.prompt,
       mode: detail.mode,
@@ -196,14 +199,17 @@ export class CcApp extends HTMLElement {
       prompt: detail.prompt,
       repo: detail.repo || undefined,
       branch: detail.branch || undefined,
+      localPath: detail.localPath || undefined,
+      strategy:
+        settings.strategy === "gh" || settings.strategy === "git" ? settings.strategy : undefined,
       mode: detail.mode,
       stopOnPlanApproval: detail.stopOnPlanApproval,
       appendSystemPrompt: detail.appendSystemPrompt || undefined,
       allowedTools: detail.allowedTools.length ? detail.allowedTools : undefined,
       disallowedTools: detail.disallowedTools.length ? detail.disallowedTools : undefined,
       auth:
-        settings.baseUrl || settings.authToken
-          ? { baseUrl: settings.baseUrl, authToken: settings.authToken }
+        settings.baseUrl || settings.authToken || settings.apiKey
+          ? { baseUrl: settings.baseUrl, authToken: settings.authToken, apiKey: settings.apiKey }
           : undefined,
     });
 

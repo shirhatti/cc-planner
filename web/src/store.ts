@@ -5,7 +5,13 @@
  * its saved plan and metadata only.
  */
 
-import type { AuthConfig, SessionMode, SessionStats } from "../lib/protocol";
+import type { AuthConfig, HydrateStrategy, SessionMode, SessionStats } from "../lib/protocol";
+
+/** App-wide settings persisted in localStorage (auth + workspace knobs). */
+export interface AppSettings extends AuthConfig {
+  /** Hydration strategy for lazy sessions; "auto" lets the server decide. */
+  strategy?: HydrateStrategy | "auto";
+}
 
 export type SessionStatus =
   | "draft"
@@ -103,10 +109,10 @@ export function deleteSession(id: string): void {
   );
 }
 
-export function loadSettings(): AuthConfig {
-  return read<AuthConfig>(SETTINGS_KEY, {});
+export function loadSettings(): AppSettings {
+  return read<AppSettings>(SETTINGS_KEY, {});
 }
 
-export function saveSettings(settings: AuthConfig): void {
+export function saveSettings(settings: AppSettings): void {
   write(SETTINGS_KEY, settings);
 }

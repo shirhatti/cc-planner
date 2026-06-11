@@ -11,10 +11,13 @@ import type { PermissionResult, SDKMessage } from "@anthropic-ai/claude-agent-sd
 import { estimateModelCostUsd, priceForModel } from "./lib/pricing";
 import type { SessionEvent } from "./lib/protocol";
 import {
+  expandHome,
   gatewayEnv,
   ClaudeSession,
+  makeRunner,
   resolveRepoMode,
   summarizeToolInput,
+  type RunnerArgs,
   type RunnerResult,
   type SessionRunner,
 } from "./lib/session";
@@ -53,6 +56,58 @@ describe("gatewayEnv", () => {
       ANTHROPIC_BASE_URL: "https://gw.example.com",
       ANTHROPIC_AUTH_TOKEN: "tok",
     });
+  });
+
+  test("maps an API key to ANTHROPIC_API_KEY", () => {
+    expect(gatewayEnv({ apiKey: " sk-ant-key " })).toEqual({ ANTHROPIC_API_KEY: "sk-ant-key" });
+    expect(gatewayEnv({ apiKey: "  " })).toEqual({});
+  });
+});
+
+describe("expandHome", () => {
+  test("expands a leading ~", () => {
+    expect(expandHome("~")).toBe(process.env.HOME!);
+    expect(expandHome("~/code/repo")).toBe(path.join(process.env.HOME!, "code", "repo"));
+  });
+
+  test("leaves absolute and relative paths alone", () => {
+    expect(expandHome("/abs/path")).toBe("/abs/path");
+    expect(expandHome("not~/expanded")).toBe("not~/expanded");
+  });
+});
+
+describe("makeRunner", () => {
+  const runnerArgs = (overrides: Partial<RunnerArgs>): RunnerArgs => ({
+    prompt: "go",
+    canUseTool: async () => ({ behavior: "deny", message: "n/a" }),
+    abortController: new AbortController(),
+    onPlan: () => {},
+    onVfsMessage: () => {},
+    ...overrides,
+  });
+
+  test("lazy mode requires a repo or local path", () => {
+    const runner = makeRunner({ mode: "lazy" });
+    expect(() => runner(runnerArgs({}))).toThrow(/repository .* or a local folder/);
+  });
+
+  test("a missing local path fails the session up front", () => {
+    const runner = makeRunner({ mode: "lazy" });
+    expect(() => runner(runnerArgs({ localPath: "/does/not/exist" }))).toThrow(/not found/);
+  });
+
+  test("local path wins over the baked default and ~ expands", () => {
+    // Point the baked default somewhere else; a bogus ~ path must be the
+    // error (proving precedence + expansion), not a baked session.
+    const dir = mkdtempSync(path.join(tmpdir(), "cc-baked-"));
+    try {
+      const runner = makeRunner({ mode: "baked", root: dir, repo: "owner/repo" });
+      expect(() => runner(runnerArgs({ localPath: "~/cc-does-not-exist-xyz" }))).toThrow(
+        new RegExp(`${process.env.HOME!}/cc-does-not-exist-xyz`),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

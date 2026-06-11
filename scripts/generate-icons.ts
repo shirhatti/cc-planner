@@ -1,7 +1,8 @@
 /**
- * Generates the PWA icons (web/public/icon-*.png) without any image
- * tooling: draws a terminal-prompt glyph into an RGBA buffer and encodes it
- * as a PNG via zlib.
+ * Generates the PWA icons (web/public/icon-*.png) and the macOS app iconset
+ * (icon.iconset/, consumed by the Electrobun build via iconutil) without any
+ * image tooling: draws a terminal-prompt glyph into an RGBA buffer and
+ * encodes it as a PNG via zlib.
  *
  * Usage: bun run scripts/generate-icons.ts
  */
@@ -116,6 +117,25 @@ function drawIcon(size: number, maskable: boolean): Uint8Array {
   return rgba;
 }
 
+/** Center a tile in a larger transparent canvas (macOS icons keep a margin). */
+function padCanvas(tile: Uint8Array, tileSize: number, canvasSize: number): Uint8Array {
+  const rgba = new Uint8Array(canvasSize * canvasSize * 4);
+  const offset = Math.floor((canvasSize - tileSize) / 2);
+  for (let y = 0; y < tileSize; y++) {
+    rgba.set(
+      tile.subarray(y * tileSize * 4, (y + 1) * tileSize * 4),
+      ((y + offset) * canvasSize + offset) * 4,
+    );
+  }
+  return rgba;
+}
+
+function drawMacIcon(size: number): Uint8Array {
+  // macOS icon artwork occupies ~80% of the canvas.
+  const tileSize = Math.round(size * 0.82);
+  return padCanvas(drawIcon(tileSize, false), tileSize, size);
+}
+
 mkdirSync(OUT_DIR, { recursive: true });
 for (const [name, size, maskable] of [
   ["icon-192.png", 192, false],
@@ -124,4 +144,15 @@ for (const [name, size, maskable] of [
 ] as const) {
   writeFileSync(path.join(OUT_DIR, name), encodePng(size, drawIcon(size, maskable)));
   console.log(`wrote web/public/${name}`);
+}
+
+const ICONSET_DIR = path.join(__dirname, "..", "icon.iconset");
+mkdirSync(ICONSET_DIR, { recursive: true });
+for (const points of [16, 32, 128, 256, 512] as const) {
+  for (const scale of [1, 2] as const) {
+    const name = scale === 1 ? `icon_${points}x${points}.png` : `icon_${points}x${points}@2x.png`;
+    const size = points * scale;
+    writeFileSync(path.join(ICONSET_DIR, name), encodePng(size, drawMacIcon(size)));
+    console.log(`wrote icon.iconset/${name}`);
+  }
 }

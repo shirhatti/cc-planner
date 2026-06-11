@@ -23,14 +23,10 @@ import {
 import { mkdtempSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
-import { fileURLToPath } from "url";
 import { bloblessClone, ghAvailable, hydrateEnv } from "./blobless-clone";
 import { buildChildEnv } from "./child-env";
+import { claudeCliPath, preloadScript } from "./runtime-paths";
 import { makeSpawnWithPreloads, type VfsMessage } from "./spawn-vfs";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VFS_VIRTUAL = path.join(__dirname, "..", "..", "preload", "vfs-virtual.ts");
-const VFS_HYDRATE = path.join(__dirname, "..", "..", "preload", "vfs-hydrate.ts");
 
 export interface RemotePlanOptions {
   /** GitHub repository as "owner/repo". */
@@ -105,13 +101,17 @@ export function planRemoteRepo(options: RemotePlanOptions): RemotePlanSession {
         ? { type: "preset", preset: "claude_code", append: options.appendSystemPrompt }
         : undefined,
       executable: "bun",
+      pathToClaudeCodeExecutable: claudeCliPath(),
       cwd: root,
       hooks: options.hooks,
       allowedTools: options.allowedTools,
       disallowedTools: options.disallowedTools,
       canUseTool: options.canUseTool,
       abortController: options.abortController,
-      spawnClaudeCodeProcess: makeSpawnWithPreloads([VFS_VIRTUAL, VFS_HYDRATE], handleMessage),
+      spawnClaudeCodeProcess: makeSpawnWithPreloads(
+        [preloadScript("vfs-virtual.ts"), preloadScript("vfs-hydrate.ts")],
+        handleMessage,
+      ),
     },
   });
 
