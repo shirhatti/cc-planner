@@ -345,14 +345,18 @@ export class ClaudeSession {
         prompt: this.input,
         permissionMode: mode,
         appendSystemPrompt: appendParts.length ? appendParts.join("\n\n") : undefined,
-        hooks: this.options.hydratingWorkspace
-          ? {
-              PreToolUse: [
-                { matcher: "Bash", hooks: [this.bashPolicyHook] },
-                { matcher: "Task", hooks: [this.taskGuidanceHook] },
-              ],
-            }
-          : undefined,
+        hooks: {
+          PreToolUse: [
+            // The Bash policy applies everywhere: read-only commands are
+            // auto-allowed on every workspace; hydration denials only fire
+            // on lazy workspaces. The Task hook needs the guidance only
+            // when hydrating.
+            { matcher: "Bash", hooks: [this.bashPolicyHook] },
+            ...(this.options.hydratingWorkspace
+              ? [{ matcher: "Task", hooks: [this.taskGuidanceHook] }]
+              : []),
+          ],
+        },
         allowedTools: [...new Set([...READ_ONLY_TOOLS, ...(req.allowedTools ?? [])])],
         disallowedTools: req.disallowedTools?.length ? req.disallowedTools : undefined,
         repo: req.repo,
@@ -417,9 +421,11 @@ export class ClaudeSession {
   }
 
   /**
-   * PreToolUse hook gating Bash on hydrating workspaces. This runs before
-   * the permission system, so it also catches commands plan mode would
-   * auto-allow without consulting canUseTool (read-only find/cat/grep).
+   * PreToolUse hook gating Bash on every workspace. It runs before the
+   * permission system, so it auto-allows read-only commands the CLI's own
+   * whitelist doesn't recognize (git ls-files/ls-tree/...) and, on
+   * hydrating workspaces, denies commands plan mode would otherwise
+   * auto-allow (read-only find/cat/grep).
    */
   private readonly bashPolicyHook: HookCallback = async (input) => {
     if (input.hook_event_name !== "PreToolUse" || input.tool_name !== "Bash") {
@@ -428,7 +434,7 @@ export class ClaudeSession {
     const command = String(
       (input.tool_input as Record<string, unknown> | undefined)?.command ?? "",
     );
-    const policy = evaluateBashCommand(command);
+    const policy = evaluateBashCommand(command, { hydrating: this.options.hydratingWorkspace });
     if (policy.verdict === "deny") {
       this.send({ type: "notice", text: `Blocked \`${command}\` — ${policy.reason}` });
       return {
@@ -523,12 +529,12 @@ export class ClaudeSession {
       return { behavior: "allow", updatedInput: input };
     }
 
-    // On lazily-hydrated workspaces, gate Bash commands that walk the tree
-    // or read files outside the VFS — deny them with guidance toward the
-    // VFS-optimal tools, and auto-allow known-safe metadata commands.
-    if (toolName === "Bash" && this.options.hydratingWorkspace) {
+    // Bash policy fallback (the PreToolUse hook is the primary path):
+    // auto-allow read-only commands everywhere; on lazily-hydrated
+    // workspaces, deny VFS-hostile commands with guidance.
+    if (toolName === "Bash") {
       const command = typeof input.command === "string" ? input.command : "";
-      const policy = evaluateBashCommand(command);
+      const policy = evaluateBashCommand(command, { hydrating: this.options.hydratingWorkspace });
       if (policy.verdict === "deny") {
         this.send({ type: "notice", text: `Blocked \`${command}\` — ${policy.reason}` });
         return { behavior: "deny", message: policy.reason ?? "Command blocked by VFS policy." };

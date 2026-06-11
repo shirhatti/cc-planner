@@ -512,15 +512,41 @@ describe("ClaudeSession", () => {
     expect(prompt).toContain("blob-less git clone");
   });
 
-  test("non-hydrating workspaces skip the Bash policy", async () => {
+  test("baked workspaces auto-allow read-only Bash with no card or denial", async () => {
     const sent: SessionEvent[] = [];
+    const results: PermissionResult[] = [];
     const runner = fakeRunner(async function* (args) {
-      await args.canUseTool("Bash", { command: "find . -name x" }, toolOptions("b4"));
+      // The hook is installed on every workspace and auto-allows read-only
+      // commands the CLI doesn't recognize (the reported git ls-tree case).
+      const hook = args.hooks?.PreToolUse?.find((m) => m.matcher === "Bash")?.hooks[0];
+      expect(hook).toBeDefined();
+      const signal = new AbortController().signal;
+      const hookOut = await hook!(
+        {
+          hook_event_name: "PreToolUse",
+          session_id: "x",
+          transcript_path: "/t",
+          cwd: "/w",
+          tool_name: "Bash",
+          tool_input: { command: "git ls-tree -r --name-only HEAD" },
+          tool_use_id: "b0",
+        },
+        "b0",
+        { signal },
+      );
+      expect(hookOut).toMatchObject({
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+      });
+      // canUseTool fallback: find is read-only on a full checkout — allowed.
+      results.push(await args.canUseTool("Bash", { command: "find . -name x" }, toolOptions("b4")));
+      // Mutating commands still produce a card.
+      results.push(await args.canUseTool("Bash", { command: "rm -rf x" }, toolOptions("b5")));
       yield* [] as SDKMessage[];
     });
     const session: ClaudeSession = new ClaudeSession((msg) => {
       sent.push(msg);
       if (msg.type === "permission_request") {
+        expect(msg.id).toBe("b5");
         session.handleClientMessage({
           type: "permission_decision",
           sessionId: "s1",
@@ -530,7 +556,8 @@ describe("ClaudeSession", () => {
       }
     }, runner);
     await session.start({ prompt: "p" });
-    // Baked workspaces: find is fine, goes through the normal permission flow.
+    expect(results[0].behavior).toBe("allow");
+    expect(results[1].behavior).toBe("allow");
     expect(sent.filter((m) => m.type === "permission_request")).toHaveLength(1);
     expect(sent.some((m) => m.type === "notice")).toBe(false);
   });

@@ -6,10 +6,14 @@ import { describe, expect, test } from "bun:test";
 import { evaluateBashCommand } from "./lib/bash-policy";
 
 function verdict(command: string): string {
-  return evaluateBashCommand(command).verdict;
+  return evaluateBashCommand(command, { hydrating: true }).verdict;
 }
 
-describe("evaluateBashCommand", () => {
+function bakedVerdict(command: string): string {
+  return evaluateBashCommand(command, { hydrating: false }).verdict;
+}
+
+describe("evaluateBashCommand (hydrating workspace)", () => {
   test("denies tree walkers", () => {
     expect(verdict("tree")).toBe("deny");
     expect(verdict("tree -L 2 src")).toBe("deny");
@@ -28,7 +32,7 @@ describe("evaluateBashCommand", () => {
   });
 
   test("denies git grep with a promisor-fetch explanation", () => {
-    const result = evaluateBashCommand("git grep planRemoteRepo");
+    const result = evaluateBashCommand("git grep planRemoteRepo", { hydrating: true });
     expect(result.verdict).toBe("deny");
     expect(result.reason).toContain("blob");
   });
@@ -86,5 +90,42 @@ describe("evaluateBashCommand", () => {
   test("skips env-var prefixes when identifying the command", () => {
     expect(verdict("FOO=bar tree")).toBe("deny");
     expect(verdict("CI=1 git status")).toBe("allow");
+  });
+});
+
+describe("evaluateBashCommand (full checkout)", () => {
+  test("read-only shell commands are auto-allowed", () => {
+    expect(bakedVerdict("find . -name '*.ts'")).toBe("allow");
+    expect(bakedVerdict("tree -L 2 src")).toBe("allow");
+    expect(bakedVerdict("cat src/main.ts")).toBe("allow");
+    expect(bakedVerdict("grep -rn pattern src")).toBe("allow");
+    expect(bakedVerdict("rg pattern")).toBe("allow");
+    expect(bakedVerdict("head -n 20 README.md")).toBe("allow");
+  });
+
+  test("git metadata commands are auto-allowed (the reported case)", () => {
+    expect(bakedVerdict("git ls-files")).toBe("allow");
+    expect(bakedVerdict("git ls-tree -r --name-only HEAD")).toBe("allow");
+    expect(bakedVerdict("git log -p")).toBe("allow");
+    expect(bakedVerdict("git grep pattern")).toBe("allow");
+    expect(bakedVerdict("git ls-files | grep test | wc -l")).toBe("allow");
+  });
+
+  test("mutating commands still ask", () => {
+    expect(bakedVerdict("git push origin main")).toBe("ask");
+    expect(bakedVerdict("rm -rf node_modules")).toBe("ask");
+    expect(bakedVerdict("bun test")).toBe("ask");
+    expect(bakedVerdict("git ls-files | xargs rm")).toBe("ask");
+  });
+
+  test("write redirects and mutating find flags are never auto-allowed", () => {
+    expect(bakedVerdict("echo secret > .env")).toBe("ask");
+    expect(bakedVerdict("git ls-files > files.txt")).toBe("ask");
+    expect(bakedVerdict("cat a.txt >> b.txt")).toBe("ask");
+    expect(bakedVerdict("find . -name '*.tmp' -delete")).toBe("ask");
+    expect(bakedVerdict("find . -exec rm {} \\;")).toBe("ask");
+    // Harmless stderr plumbing doesn't trip the redirect guard.
+    expect(bakedVerdict("find . -name x 2>/dev/null")).toBe("allow");
+    expect(bakedVerdict("git status 2>&1")).toBe("allow");
   });
 });

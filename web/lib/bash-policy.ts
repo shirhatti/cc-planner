@@ -1,20 +1,30 @@
 /**
- * Bash command policy for lazily-hydrated workspaces.
+ * Bash command policy for the web TTY, in two layers:
  *
- * A blob-less clone serves the directory tree from a manifest inside the
- * claude process, but shell commands run as subprocesses *outside* the VFS:
- * readers (cat/head/tail) see only files that have already been hydrated,
- * and tree-walkers (tree, find, recursive grep, git grep) either return
- * misleading results or force the whole repo to be fetched. This policy
- * auto-denies those commands with guidance toward the VFS-optimal tools
- * (Glob/LS for structure, Read for contents, targeted git metadata
- * commands), auto-allows known-safe commands, and leaves everything else to
- * the normal permission flow.
+ * 1. Universal read-only layer (every workspace): known read-only commands —
+ *    shell readers, listings, git metadata — execute without a permission
+ *    prompt, provided the segment has no write redirect and no execution
+ *    flags (find -delete/-exec). Anything unknown or mutating still goes
+ *    through the normal permission card.
+ *
+ * 2. Hydration layer (lazily-hydrated workspaces only): a blob-less clone
+ *    serves the directory tree from a manifest inside the claude process,
+ *    but shell commands run as subprocesses *outside* the VFS: readers
+ *    (cat/head/tail) see only files that have already been hydrated, and
+ *    tree-walkers (tree, find, recursive grep, git grep) either return
+ *    misleading results or force the whole repo to be fetched. Those are
+ *    denied with guidance toward the VFS-optimal tools (Glob/LS for
+ *    structure, Read for contents, targeted git metadata commands).
  */
 
 export interface BashPolicyResult {
   verdict: "allow" | "deny" | "ask";
   reason?: string;
+}
+
+export interface BashPolicyOptions {
+  /** The workspace is a lazily-hydrated (blob-less) clone. */
+  hydrating?: boolean;
 }
 
 const USE_GLOB =
@@ -47,6 +57,47 @@ const GIT_SAFE = new Set([
 /** Commands that are always safe and need no permission round-trip. */
 const ALWAYS_SAFE = new Set(["pwd", "echo", "true", "which", "basename", "dirname", "date", "ls"]);
 
+/**
+ * Read-only shell commands. Auto-allowed on full checkouts; on hydrating
+ * workspaces most of these are denied by the hydration layer instead.
+ */
+const READ_ONLY_SHELL = new Set([
+  ...ALWAYS_SAFE,
+  "tree",
+  "find",
+  "du",
+  "rg",
+  "ag",
+  "ack",
+  "grep",
+  "egrep",
+  "fgrep",
+  "cat",
+  "less",
+  "more",
+  "strings",
+  "head",
+  "tail",
+  "wc",
+  "file",
+  "stat",
+  "diff",
+  "sort",
+  "uniq",
+  "cut",
+  "tr",
+]);
+
+/** A segment writes to the filesystem via shell redirection. */
+function hasWriteRedirect(segment: string): boolean {
+  // Ignore harmless stderr plumbing (2>/dev/null, 2>&1) before checking.
+  const cleaned = segment.replace(/\d?>&\d|\d>>?\s*\/dev\/null/g, "");
+  return cleaned.includes(">");
+}
+
+/** find flags that execute commands or delete files. */
+const FIND_MUTATING_FLAGS = new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint"]);
+
 /** Tokenize one pipeline segment, tracking flags vs. positional args. */
 function parseSegment(segment: string): { cmd: string; flags: string[]; args: string[] } {
   const tokens = segment.trim().split(/\s+/).filter(Boolean);
@@ -72,10 +123,32 @@ function parseSegment(segment: string): { cmd: string; flags: string[]; args: st
   return { cmd: cmd.replace(/^.*\//, ""), flags, args };
 }
 
-function evaluateSegment(segment: string): BashPolicyResult {
+function evaluateSegment(segment: string, hydrating: boolean): BashPolicyResult {
   const { cmd, flags, args } = parseSegment(segment);
   if (!cmd) return { verdict: "allow" };
 
+  // Writes via redirection are never auto-allowed, in any workspace.
+  if (hasWriteRedirect(segment)) return { verdict: "ask" };
+
+  if (cmd === "find" && flags.some((f) => FIND_MUTATING_FLAGS.has(f))) {
+    return hydrating
+      ? { verdict: "deny", reason: `Don't use find: ${USE_GLOB}` }
+      : { verdict: "ask" };
+  }
+
+  // Universal layer: on a full checkout every read-only command is fine.
+  if (!hydrating) {
+    if (READ_ONLY_SHELL.has(cmd)) return { verdict: "allow" };
+    if (cmd === "git") {
+      const sub = args[0];
+      return sub && (GIT_SAFE.has(sub) || sub === "grep")
+        ? { verdict: "allow" }
+        : { verdict: "ask" };
+    }
+    return { verdict: "ask" };
+  }
+
+  // Hydration layer below: deny VFS-hostile commands with guidance.
   const hasRecursiveFlag = flags.some(
     (f) => f === "-R" || f === "--recursive" || /^-[a-zA-Z]*r/.test(f),
   );
@@ -157,11 +230,13 @@ function evaluateSegment(segment: string): BashPolicyResult {
 }
 
 /**
- * Evaluate a full Bash command for a hydrating workspace. Compound commands
- * are split on shell separators and the strictest segment verdict wins
- * (deny > ask > allow).
+ * Evaluate a full Bash command. Compound commands are split on shell
+ * separators and the strictest segment verdict wins (deny > ask > allow).
  */
-export function evaluateBashCommand(command: string): BashPolicyResult {
+export function evaluateBashCommand(
+  command: string,
+  options: BashPolicyOptions = {},
+): BashPolicyResult {
   const segments = command
     .split(/&&|\|\||;|\||\n/)
     .map((s) => s.trim())
@@ -169,7 +244,7 @@ export function evaluateBashCommand(command: string): BashPolicyResult {
 
   let result: BashPolicyResult = { verdict: "allow" };
   for (const segment of segments) {
-    const verdict = evaluateSegment(segment);
+    const verdict = evaluateSegment(segment, options.hydrating ?? false);
     if (verdict.verdict === "deny") return verdict;
     if (verdict.verdict === "ask") result = verdict;
   }
