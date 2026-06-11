@@ -46,6 +46,17 @@ describe("evaluateBashCommand", () => {
     expect(verdict("git log | wc -l")).toBe("allow");
   });
 
+  test("denies history-wide content sweeps but allows targeted commit inspection", () => {
+    expect(verdict("git log -p")).toBe("deny");
+    expect(verdict("git log --stat")).toBe("deny");
+    expect(verdict("git log --all -S planRemoteRepo")).toBe("deny");
+    expect(verdict("git log --oneline --all")).toBe("allow");
+    expect(verdict("git log --name-only --no-renames")).toBe("allow");
+    // One commit's worth of blobs is targeted hydration — allowed.
+    expect(verdict("git show abc123 --stat")).toBe("allow");
+    expect(verdict("git diff HEAD~1")).toBe("allow");
+  });
+
   test("allows read-only git metadata commands", () => {
     expect(verdict("git status")).toBe("allow");
     expect(verdict("git log --oneline -10")).toBe("allow");

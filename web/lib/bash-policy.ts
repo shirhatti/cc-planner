@@ -134,6 +134,20 @@ function evaluateSegment(segment: string): BashPolicyResult {
             USE_TARGETED,
         };
       }
+      // History-wide content flags fetch the changed blobs of every commit
+      // shown (rename detection and pickaxe fetch even more). Targeted
+      // single-commit inspection (git show/diff) stays allowed.
+      if (sub === "log") {
+        const contentFlag = flags.find((f) =>
+          /^(-p|--patch|--stat|--numstat|--shortstat|--cc|-u)$|^-[SG]/.test(f),
+        );
+        if (contentFlag) {
+          return {
+            verdict: "deny",
+            reason: `Don't use git log ${contentFlag}: it promisor-fetches blobs for every commit shown. Use git log --format/--name-only --no-renames for metadata, git show <sha> for one commit, or Read for current file contents`,
+          };
+        }
+      }
       if (sub && GIT_SAFE.has(sub)) return { verdict: "allow" };
       return { verdict: "ask" };
     }
@@ -167,10 +181,12 @@ export function evaluateBashCommand(command: string): BashPolicyResult {
  * workspace, steering exploration toward VFS-optimal tools up front.
  */
 export const HYDRATION_GUIDANCE = `
-This workspace is a blob-less git clone: the full directory tree is always visible, but file contents are fetched over the network the first time each file is read. Work with that, not against it:
+This workspace is a blob-less git clone: the full directory tree is always visible to the Glob/LS/Read tools, but file contents are fetched over the network the first time each file is read. Work with that, not against it:
+- The working tree looks EMPTY to shell commands (ls, find) — that is expected, not an error or a sparse checkout. The manifest-backed tools see everything; do not probe the checkout configuration.
 - Use the Glob and LS tools to explore structure — they are served from the repo manifest and fetch nothing.
 - Use the Read tool for file contents — it hydrates exactly the files you read.
 - The Grep tool and shell commands run outside this layer: they only see files that have already been read. Locate files with Glob and Read the relevant ones rather than searching broadly.
-- Read-only git metadata commands (git log, git show, git diff, git ls-files, git ls-tree) are cheap and reliable.
-- Avoid tree, find, ls -R, recursive grep/rg, git grep, du, and bulk file readers (cat/head/tail) — they walk the tree, force unnecessary downloads, or return misleading results. These commands are blocked in this workspace.
+- Cheap git metadata commands: git log (without -p/--stat), git ls-files, git ls-tree, git show <sha> --name-only --no-renames. Filtering metadata in a pipe is fine (git ls-files | grep ...).
+- git show <sha> and git diff fetch the changed files' contents for that one commit — fine for inspecting a specific commit, but do not sweep history with git log -p/--stat/-S or git grep; those download blobs for every commit they touch and are blocked here.
+- Avoid tree, find, ls -R, recursive grep/rg, du, and bulk file readers (cat/head/tail) — they walk the tree, force unnecessary downloads, or return misleading results. These commands are blocked in this workspace.
 `.trim();

@@ -346,7 +346,12 @@ export class ClaudeSession {
         permissionMode: mode,
         appendSystemPrompt: appendParts.length ? appendParts.join("\n\n") : undefined,
         hooks: this.options.hydratingWorkspace
-          ? { PreToolUse: [{ matcher: "Bash", hooks: [this.bashPolicyHook] }] }
+          ? {
+              PreToolUse: [
+                { matcher: "Bash", hooks: [this.bashPolicyHook] },
+                { matcher: "Task", hooks: [this.taskGuidanceHook] },
+              ],
+            }
           : undefined,
         allowedTools: [...new Set([...READ_ONLY_TOOLS, ...(req.allowedTools ?? [])])],
         disallowedTools: req.disallowedTools?.length ? req.disallowedTools : undefined,
@@ -441,6 +446,27 @@ export class ClaudeSession {
     }
     // "ask": let the normal permission flow (canUseTool → browser card) decide.
     return {};
+  };
+
+  /**
+   * Subagents (Task tool) get their own prompts and never see the main
+   * agent's system-prompt append — without this they rediscover the
+   * workspace rules by trial and error (probing the empty worktree, trying
+   * find/cat). Inject the hydration guidance into every subagent prompt.
+   */
+  private readonly taskGuidanceHook: HookCallback = async (input) => {
+    if (input.hook_event_name !== "PreToolUse" || input.tool_name !== "Task") {
+      return {};
+    }
+    const toolInput = input.tool_input as Record<string, unknown> | undefined;
+    const prompt = typeof toolInput?.prompt === "string" ? toolInput.prompt : "";
+    if (!prompt) return {};
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        updatedInput: { ...toolInput, prompt: `${prompt}\n\n${HYDRATION_GUIDANCE}` },
+      },
+    };
   };
 
   private readonly canUseTool: CanUseTool = async (toolName, input, { toolUseID, signal }) => {

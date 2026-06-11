@@ -473,6 +473,45 @@ describe("ClaudeSession", () => {
     expect(sent.some((m) => m.type === "notice" && m.text.includes("find"))).toBe(true);
   });
 
+  test("subagent prompts get the hydration guidance injected via the Task hook", async () => {
+    const hookOutputs: unknown[] = [];
+    const runner: SessionRunner = (args) => {
+      const gen = (async function* () {
+        const matchers = args.hooks?.PreToolUse ?? [];
+        const taskHook = matchers.find((m) => m.matcher === "Task")?.hooks[0];
+        expect(taskHook).toBeDefined();
+        const signal = new AbortController().signal;
+        hookOutputs.push(
+          await taskHook!(
+            {
+              hook_event_name: "PreToolUse",
+              session_id: "x",
+              transcript_path: "/t",
+              cwd: "/w",
+              tool_name: "Task",
+              tool_input: { description: "explore", prompt: "Find OTel usage." },
+              tool_use_id: "t1",
+            },
+            "t1",
+            { signal },
+          ),
+        );
+        yield* [] as SDKMessage[];
+      })() as RunnerResult["session"];
+      return { session: gen, repo: "owner/repo", ref: "abc123def456" };
+    };
+
+    const session = new ClaudeSession(() => {}, runner, { hydratingWorkspace: true });
+    await session.start({ prompt: "p" });
+
+    const output = hookOutputs[0] as {
+      hookSpecificOutput?: { updatedInput?: { prompt?: string } };
+    };
+    const prompt = output.hookSpecificOutput?.updatedInput?.prompt ?? "";
+    expect(prompt.startsWith("Find OTel usage.")).toBe(true);
+    expect(prompt).toContain("blob-less git clone");
+  });
+
   test("non-hydrating workspaces skip the Bash policy", async () => {
     const sent: SessionEvent[] = [];
     const runner = fakeRunner(async function* (args) {
