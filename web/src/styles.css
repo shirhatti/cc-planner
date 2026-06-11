@@ -685,13 +685,17 @@ cc-diff {
 
 /* ---- start form extras ---- */
 
-select.mode {
+select {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 8px;
   color: var(--text);
   padding: 8px 10px;
   font: inherit;
+}
+
+.settings select {
+  width: 100%;
 }
 
 .stop-on-approval {

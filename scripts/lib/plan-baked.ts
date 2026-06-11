@@ -71,7 +71,7 @@ export function resolveBakedRef(root: string): string {
 
 export function planBakedRepo(options: BakedPlanOptions): BakedPlanSession {
   if (!existsSync(options.root)) {
-    throw new Error(`planBakedRepo: baked repo not found at ${options.root}`);
+    throw new Error(`Repo folder not found: ${options.root}`);
   }
 
   const handleMessage = (msg: VfsMessage): void => {

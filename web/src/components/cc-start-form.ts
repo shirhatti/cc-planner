@@ -1,10 +1,10 @@
 /**
- * <cc-start-form> — for a draft session: repo/branch/prompt inputs, the
- * permission-mode picker, and the planner stop-on-approval toggle (repo
- * inputs are hidden in baked mode). For a started session: a read-only
- * summary.
+ * <cc-start-form> — for a draft session: workspace source (GitHub repo,
+ * local folder on the server's machine, or the server's baked default),
+ * prompt input, the permission-mode picker, and the planner
+ * stop-on-approval toggle. For a started session: a read-only summary.
  *
- * Emits "start-session" with { repo, branch, prompt, mode, stopOnPlanApproval }.
+ * Emits "start-session" with { repo, branch, localPath, prompt, mode, ... }.
  */
 
 import type { SessionMode } from "../../lib/protocol";
@@ -13,6 +13,8 @@ import type { SessionRecord } from "../store";
 export interface StartSessionDetail {
   repo: string;
   branch: string;
+  /** Absolute path (~ ok) of a checkout on the server's filesystem. */
+  localPath: string;
   prompt: string;
   mode: SessionMode;
   stopOnPlanApproval: boolean;
@@ -47,12 +49,24 @@ export class CcStartForm extends HTMLElement {
     if (!record) return;
 
     if (record.status === "draft") {
+      const baked = this.workspaceMode === "baked";
       const form = document.createElement("form");
       form.className = "start-form";
       form.innerHTML = `
-        <div class="row repo-row" ${this.workspaceMode === "baked" ? "hidden" : ""}>
+        <div class="row">
+          <select class="source">
+            ${baked ? `<option value="baked">Server repo (baked)</option>` : ""}
+            <option value="repo">GitHub repo</option>
+            <option value="local">Local folder</option>
+          </select>
+        </div>
+        <div class="row repo-row" ${baked ? "hidden" : ""}>
           <input class="repo" type="text" placeholder="owner/repo" spellcheck="false" />
           <input class="branch" type="text" placeholder="branch (optional)" spellcheck="false" />
+        </div>
+        <div class="row local-row" hidden>
+          <input class="local-path" type="text"
+            placeholder="/absolute/path/to/checkout or ~/code/repo" spellcheck="false" />
         </div>
         <div class="row">
           <select class="mode">
@@ -88,7 +102,11 @@ export class CcStartForm extends HTMLElement {
           <span class="form-error muted"></span>
         </div>`;
 
+      const sourceSelect = form.querySelector<HTMLSelectElement>(".source")!;
+      const repoRow = form.querySelector<HTMLElement>(".repo-row")!;
+      const localRow = form.querySelector<HTMLElement>(".local-row")!;
       const repoInput = form.querySelector<HTMLInputElement>(".repo")!;
+      const localInput = form.querySelector<HTMLInputElement>(".local-path")!;
       const promptInput = form.querySelector<HTMLTextAreaElement>(".prompt")!;
       const modeSelect = form.querySelector<HTMLSelectElement>(".mode")!;
       const stopLabel = form.querySelector<HTMLElement>(".stop-on-approval")!;
@@ -99,18 +117,29 @@ export class CcStartForm extends HTMLElement {
       modeSelect.onchange = () => {
         stopLabel.hidden = modeSelect.value !== "plan";
       };
+      sourceSelect.value = baked ? "baked" : "repo";
+      sourceSelect.onchange = () => {
+        repoRow.hidden = sourceSelect.value !== "repo";
+        localRow.hidden = sourceSelect.value !== "local";
+      };
 
       form.onsubmit = (ev) => {
         ev.preventDefault();
-        const repo = repoInput.value.trim();
+        const source = sourceSelect.value;
+        const repo = source === "repo" ? repoInput.value.trim() : "";
+        const localPath = source === "local" ? localInput.value.trim() : "";
         const prompt = promptInput.value.trim();
         const errorEl = form.querySelector(".form-error")!;
         if (!prompt) {
           errorEl.textContent = "Enter a first message";
           return;
         }
-        if (this.workspaceMode === "lazy" && !/^[\w.-]+\/[\w.-]+$/.test(repo)) {
+        if (source === "repo" && !/^[\w.-]+\/[\w.-]+$/.test(repo)) {
           errorEl.textContent = "Enter a repo as owner/repo";
+          return;
+        }
+        if (source === "local" && !/^[~/]/.test(localPath)) {
+          errorEl.textContent = "Enter an absolute folder path (or ~/...)";
           return;
         }
         const csv = (selector: string): string[] =>
@@ -124,7 +153,11 @@ export class CcStartForm extends HTMLElement {
             bubbles: true,
             detail: {
               repo,
-              branch: form.querySelector<HTMLInputElement>(".branch")!.value.trim(),
+              branch:
+                source === "repo"
+                  ? form.querySelector<HTMLInputElement>(".branch")!.value.trim()
+                  : "",
+              localPath,
               prompt,
               mode: modeSelect.value as SessionMode,
               stopOnPlanApproval: stopCheckbox.checked,

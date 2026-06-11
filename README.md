@@ -84,7 +84,8 @@ bun run start & bun run dev:ui
 - **Plan mode + review** — the plan panel renders the plan markdown live as Claude writes it (via the plan-file VFS IPC events). When Claude calls `ExitPlanMode`, a review bar appears: approve or request changes with feedback. "End session when plan is approved" (on by default in plan mode) preserves the classic planner workflow; turn it off and approval lets Claude continue into implementation under browser-prompted permissions.
 - **Session stats** — duration (ticking live), token usage by type and per model, turn count, and hydration volume. Cost is always **estimated from public Claude API token pricing** (`web/lib/pricing.ts`) and marked `~`/`(est.)`; the SDK's own cost figure is never displayed.
 - **localStorage persistence** — prompts, repo metadata, status, stats, and the latest plan of every session persist in the browser (live transcripts are not persisted across reloads).
-- **LLM gateway support** — set an Anthropic base URL and bearer token in the sidebar; they become `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` in the child claude process.
+- **Settings in the UI** — the sidebar settings (persisted in localStorage, sent with each new session) cover what would otherwise be server env vars, which matters for the desktop app: an Anthropic API key (`ANTHROPIC_API_KEY`), an LLM gateway base URL + bearer token (`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`), and the hydration strategy for lazy sessions (`gh` / `git` / auto). Leave auth empty to use the server's environment — e.g. an existing `claude` login on the desktop.
+- **Local folder workspaces** — the start form's workspace picker accepts an absolute path (`~` ok) to a checkout on the server's machine instead of a GitHub repo: no clone, no hydration, sessions run directly against the folder. On the desktop app the server _is_ the user's machine, making this the natural mode for working on local repos.
 - **PWA** — installable, with a web manifest and an auto-updating service worker (app shell precached, hashed assets cached on demand).
 - **Prompt-free read-only tools** — `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`, and `TodoWrite` never require a permission prompt in any permission mode: they're answered by the VFS layer (manifest-backed listings, on-demand reads) and passed to the CLI as `allowedTools`, with a `canUseTool` short-circuit as fallback.
 - **Per-session tool & prompt configuration** — the start form's _Advanced_ section takes extra always-allowed tools (including `Bash(...)` patterns like `Bash(bun test:*)`), disallowed tools (removed from the session entirely), and extra system-prompt instructions. Custom instructions are appended to the Claude Code preset system prompt (the SDK supports append only — there is no prepend) and compose with the hydration guidance on lazy workspaces.
@@ -97,9 +98,10 @@ The frontend is TypeScript Web Components built with Vite (`web/src/`), typed ag
 | Mode                         | Repo contents                                                              | When                                                                |
 | ---------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------- |
 | **Lazy hydration** (default) | Blob-less clone per session; file contents hydrated on Claude's first read | Plan against any repo without downloading it                        |
+| **Local folder**             | A checkout already on the server's filesystem, chosen per session          | Desktop app, or a volume mounted into the container                 |
 | **Baked**                    | Full clone burned into the container image at build time                   | Zero clone/hydration latency and no GitHub access needed at runtime |
 
-Baked mode is enabled by pointing `CC_BAKED_REPO_PATH` at a checkout (plus optional `CC_BAKED_REPO=owner/repo` as a label); the Dockerfile wires this up automatically.
+The workspace is resolved per session: a local path from the start form wins, then the server's baked default, then lazy hydration against the given `owner/repo`. Baked mode is enabled by pointing `CC_BAKED_REPO_PATH` at a checkout (plus optional `CC_BAKED_REPO=owner/repo` as a label); the Dockerfile wires this up automatically.
 
 ### Docker
 
@@ -132,6 +134,8 @@ How the bundle stays self-contained (`electrobun.config.ts` + `desktop/index.ts`
 - The Vite UI build, the `preload/` VFS scripts, and the Claude Agent SDK package (its `cli.js` is what sessions spawn) are copied into `Resources/app/`; `desktop/index.ts` points the session runners at them via `CC_RESOURCES_ROOT` (see `scripts/lib/runtime-paths.ts`). ASAR stays off because preload scripts and `cli.js` must be real files for `bun --preload` and child spawning.
 - The bundled Bun runtime (`Contents/MacOS/bun`) is prepended to `PATH`, so spawned sessions don't need a system bun install. Homebrew dirs are appended too, since GUI apps launch with a minimal `PATH` and lazy hydration needs `git`/`gh`.
 - App icons come from `icon.iconset/`, generated alongside the PWA icons by `bun run scripts/generate-icons.ts` and converted by `iconutil` during the build.
+
+No env vars are needed to configure the app: auth (API key or gateway), the hydration strategy, and local-folder workspaces are all set in the UI (see [the settings and workspace features](#web-tty)). Sessions fall back to the server environment for auth, so an existing `claude` login on the machine just works.
 
 The app builds unsigned by default; enable `mac.codesign`/`mac.notarize`/`mac.createDmg` in `electrobun.config.ts` to distribute it.
 

@@ -16,6 +16,7 @@
  */
 
 import { existsSync, readFileSync } from "fs";
+import { homedir } from "os";
 import path from "path";
 import type {
   CanUseTool,
@@ -35,6 +36,7 @@ import type {
   AuthConfig,
   ClientMessage,
   DiffPayload,
+  HydrateStrategy,
   SessionEvent,
   SessionMode,
   SessionStats,
@@ -129,6 +131,10 @@ export interface RunnerArgs {
   disallowedTools?: string[];
   repo?: string;
   branch?: string;
+  /** Run against this checkout on the server's filesystem (no clone/hydration). */
+  localPath?: string;
+  /** Lazy mode: hydration strategy override. */
+  strategy?: HydrateStrategy;
   canUseTool: CanUseTool;
   abortController: AbortController;
   onPlan: (content: string, filename: string) => void;
@@ -144,31 +150,48 @@ export interface RunnerResult {
 
 export type SessionRunner = (args: RunnerArgs) => RunnerResult;
 
-export function makeRunner(mode: RepoMode): SessionRunner {
-  if (mode.mode === "baked") {
-    const root = mode.root;
-    if (!root) throw new Error("baked mode requires a repo root");
-    return (args) => {
-      const { session, ref } = planBakedRepo({ ...args, root });
-      return { session, repo: mode.repo ?? root, ref };
-    };
-  }
+/** Expand a leading `~` to the server's home directory. */
+export function expandHome(p: string): string {
+  if (p === "~") return homedir();
+  return p.startsWith("~/") ? path.join(homedir(), p.slice(2)) : p;
+}
+
+/**
+ * The workspace is resolved per session: an explicit local path wins, then
+ * the server's baked default (CC_BAKED_REPO_PATH), then lazy hydration
+ * against `repo`.
+ */
+export function makeRunner(defaultMode: RepoMode): SessionRunner {
   return (args) => {
+    if (args.localPath) {
+      const root = expandHome(args.localPath.trim());
+      const { session, ref } = planBakedRepo({ ...args, root });
+      return { session, repo: root, ref };
+    }
+    if (defaultMode.mode === "baked") {
+      const root = defaultMode.root;
+      if (!root) throw new Error("baked mode requires a repo root");
+      const { session, ref } = planBakedRepo({ ...args, root });
+      return { session, repo: defaultMode.repo ?? root, ref };
+    }
     const repo = args.repo;
-    if (!repo) throw new Error('A repository ("owner/repo") is required in lazy hydration mode');
+    if (!repo) {
+      throw new Error('A repository ("owner/repo") or a local folder is required');
+    }
     const { session, ref } = planRemoteRepo({ ...args, repo });
     return { session, repo, ref };
   };
 }
 
 /**
- * Env overrides for routing the child claude process through an LLM gateway
- * with a custom base URL and/or bearer token.
+ * Env overrides for authenticating the child claude process: an API key,
+ * and/or an LLM gateway with a custom base URL and bearer token.
  */
 export function gatewayEnv(auth?: AuthConfig): Record<string, string> {
   const env: Record<string, string> = {};
   if (auth?.baseUrl?.trim()) env.ANTHROPIC_BASE_URL = auth.baseUrl.trim();
   if (auth?.authToken?.trim()) env.ANTHROPIC_AUTH_TOKEN = auth.authToken.trim();
+  if (auth?.apiKey?.trim()) env.ANTHROPIC_API_KEY = auth.apiKey.trim();
   return env;
 }
 
@@ -272,6 +295,8 @@ export interface StartRequest {
   prompt: string;
   repo?: string;
   branch?: string;
+  localPath?: string;
+  strategy?: HydrateStrategy;
   mode?: SessionMode;
   stopOnPlanApproval?: boolean;
   appendSystemPrompt?: string;
@@ -357,6 +382,8 @@ export class ClaudeSession {
         disallowedTools: req.disallowedTools?.length ? req.disallowedTools : undefined,
         repo: req.repo,
         branch: req.branch,
+        localPath: req.localPath,
+        strategy: req.strategy,
         extraEnv: gatewayEnv(req.auth),
         canUseTool: this.canUseTool,
         abortController: this.abort,

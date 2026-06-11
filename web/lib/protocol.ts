@@ -18,13 +18,18 @@ export interface UserQuestion {
   options: { label: string; description: string }[];
 }
 
-/** Optional overrides for routing API traffic through an LLM gateway. */
+/** Optional auth overrides for the claude process. */
 export interface AuthConfig {
   /** Sets ANTHROPIC_BASE_URL for the claude process. */
   baseUrl?: string;
   /** Sets ANTHROPIC_AUTH_TOKEN (sent as a Bearer token) for the claude process. */
   authToken?: string;
+  /** Sets ANTHROPIC_API_KEY for the claude process. */
+  apiKey?: string;
 }
+
+/** How lazy-hydration sessions fetch file contents. */
+export type HydrateStrategy = "gh" | "git";
 
 /** A file change extracted from an Edit/Write tool call, for diff rendering. */
 export interface DiffPayload {
@@ -80,9 +85,18 @@ export type ClientMessage =
       sessionId: string;
       /** The first user message of the session. */
       prompt: string;
-      /** owner/repo — required in lazy mode, ignored in baked mode. */
+      /** owner/repo — required in lazy mode (unless localPath is set). */
       repo?: string;
       branch?: string;
+      /**
+       * Absolute path (~ ok) of a checkout on the server's filesystem to run
+       * the session against — no clone, no hydration. Takes precedence over
+       * `repo` and the server's baked default. The natural mode for the
+       * desktop app, where the server runs on the user's machine.
+       */
+      localPath?: string;
+      /** Lazy mode: override how file contents are hydrated. */
+      strategy?: HydrateStrategy;
       /** Permission mode. Defaults to "plan". */
       mode?: SessionMode;
       /**

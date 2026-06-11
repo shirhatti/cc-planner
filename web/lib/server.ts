@@ -103,11 +103,13 @@ export function startServer(options: StartServerOptions): WebTtyServer {
             sendTo(ws, { type: "error", sessionId, message: "Session already started" });
             return;
           }
+          const localPath = typeof msg.localPath === "string" ? msg.localPath.trim() : "";
           const session = new ClaudeSession(
             (event) => sendTo(ws, { ...event, sessionId }),
             runner,
             {
-              hydratingWorkspace: repoMode.mode === "lazy",
+              // Local-path sessions are full checkouts — no hydration.
+              hydratingWorkspace: repoMode.mode === "lazy" && !localPath,
             },
           );
           ws.data.sessions.set(sessionId, session);
@@ -116,6 +118,8 @@ export function startServer(options: StartServerOptions): WebTtyServer {
               prompt: msg.prompt,
               repo: msg.repo,
               branch: msg.branch,
+              localPath: localPath || undefined,
+              strategy: msg.strategy === "gh" || msg.strategy === "git" ? msg.strategy : undefined,
               mode: msg.mode,
               stopOnPlanApproval: msg.stopOnPlanApproval,
               appendSystemPrompt: msg.appendSystemPrompt,
