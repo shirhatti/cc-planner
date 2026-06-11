@@ -20,13 +20,9 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { spawnSync } from "child_process";
 import { existsSync } from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import { buildChildEnv } from "./child-env";
+import { claudeCliPath, preloadScript } from "./runtime-paths";
 import { makeSpawnWithPreloads, type VfsMessage } from "./spawn-vfs";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VFS_VIRTUAL = path.join(__dirname, "..", "..", "preload", "vfs-virtual.ts");
 
 export interface BakedPlanOptions {
   /** Absolute path of the checked-out repo (e.g. /repo in the container). */
@@ -94,13 +90,17 @@ export function planBakedRepo(options: BakedPlanOptions): BakedPlanSession {
         ? { type: "preset", preset: "claude_code", append: options.appendSystemPrompt }
         : undefined,
       executable: "bun",
+      pathToClaudeCodeExecutable: claudeCliPath(),
       cwd: options.root,
       hooks: options.hooks,
       allowedTools: options.allowedTools,
       disallowedTools: options.disallowedTools,
       canUseTool: options.canUseTool,
       abortController: options.abortController,
-      spawnClaudeCodeProcess: makeSpawnWithPreloads([VFS_VIRTUAL], handleMessage),
+      spawnClaudeCodeProcess: makeSpawnWithPreloads(
+        [preloadScript("vfs-virtual.ts")],
+        handleMessage,
+      ),
     },
   });
 

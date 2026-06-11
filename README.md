@@ -118,10 +118,28 @@ docker run -p 3000:3000 -e ANTHROPIC_API_KEY=sk-ant-... cc-planner-baked
 
 For a private repo at build time, pass `--build-arg BAKE_TOKEN=$(gh auth token)` (prefer an ephemeral fine-grained token: build args are recorded in image metadata). Instead of `ANTHROPIC_API_KEY` you can set `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` on the container, or supply them per session from the browser's gateway settings.
 
+### Desktop app (macOS)
+
+[Electrobun](https://electrobun.dev) packages the web TTY as a native macOS app, so there's no server lifetime to manage: the Electrobun main process is a Bun process that embeds the same server (`web/lib/server.ts`) on an ephemeral port, opens a native window pointed at it, and exits — server, sessions, and child claude processes included — when the window closes.
+
+```bash
+bun run app:dev      # build the UI, then build + launch the dev app
+bun run app:build    # production build → build/stable-macos-*/
+```
+
+How the bundle stays self-contained (`electrobun.config.ts` + `desktop/index.ts`):
+
+- The Vite UI build, the `preload/` VFS scripts, and the Claude Agent SDK package (its `cli.js` is what sessions spawn) are copied into `Resources/app/`; `desktop/index.ts` points the session runners at them via `CC_RESOURCES_ROOT` (see `scripts/lib/runtime-paths.ts`). ASAR stays off because preload scripts and `cli.js` must be real files for `bun --preload` and child spawning.
+- The bundled Bun runtime (`Contents/MacOS/bun`) is prepended to `PATH`, so spawned sessions don't need a system bun install. Homebrew dirs are appended too, since GUI apps launch with a minimal `PATH` and lazy hydration needs `git`/`gh`.
+- App icons come from `icon.iconset/`, generated alongside the PWA icons by `bun run scripts/generate-icons.ts` and converted by `iconutil` during the build.
+
+The app builds unsigned by default; enable `mac.codesign`/`mac.notarize`/`mac.createDmg` in `electrobun.config.ts` to distribute it.
+
 ### Web architecture
 
 ```
-browser (Vite + TS Web Components)  ←WebSocket→  web/server.ts (Bun.serve, serves web/dist)
+browser (Vite + TS Web Components)  ←WebSocket→  web/lib/server.ts (Bun.serve, serves web/dist)
+                                                   hosts: web/server.ts (CLI) / desktop/index.ts (macOS app)
   cc-app / cc-feed / cc-composer                   ClaudeSession (web/lib/session.ts)
   cc-plan-panel / cc-question-card                   ├─ InputQueue → SDK streaming input (multi-turn)
   cc-diff (@pierre/diffs) / cc-stats-panel           ├─ canUseTool → question / plan review / permission cards
@@ -135,14 +153,15 @@ Every session-scoped WebSocket message carries a client-generated `sessionId` (`
 
 All `CC_`-prefixed env vars in one place:
 
-| Variable              | Read by                  | Default                         | Description                                                                                                                                                                                            |
-| --------------------- | ------------------------ | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `CC_BAKED_REPO_PATH`  | `web/server.ts`          | unset                           | Path to a fully checked-out repo. If the directory exists, the web app runs in **baked** mode and plans against it; otherwise it runs in **lazy hydration** mode. The Dockerfile sets this to `/repo`. |
-| `CC_BAKED_REPO`       | `web/server.ts`          | unset                           | `owner/repo` label for the baked checkout, shown in the UI and session records. Set from the `BAKE_REPO` build arg by the Dockerfile.                                                                  |
-| `CC_HYDRATE_ROOT`     | `preload/vfs-hydrate.ts` | unset (preload is inert)        | Path of the blob-less working tree to hydrate into.                                                                                                                                                    |
-| `CC_HYDRATE_REPO`     | `preload/vfs-hydrate.ts` | parsed from the `origin` remote | `owner/repo` used for `gh api` content fetches.                                                                                                                                                        |
-| `CC_HYDRATE_REF`      | `preload/vfs-hydrate.ts` | `HEAD`'s sha                    | Commit to hydrate file contents from.                                                                                                                                                                  |
-| `CC_HYDRATE_STRATEGY` | `preload/vfs-hydrate.ts` | `gh`                            | How contents are fetched: `gh` (GitHub contents API) or `git` (promisor lazy fetch). See [Hydration Strategies](#hydration-strategies).                                                                |
+| Variable              | Read by                        | Default                          | Description                                                                                                                                                                                             |
+| --------------------- | ------------------------------ | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CC_BAKED_REPO_PATH`  | `web/lib/server.ts`            | unset                            | Path to a fully checked-out repo. If the directory exists, the web app runs in **baked** mode and plans against it; otherwise it runs in **lazy hydration** mode. The Dockerfile sets this to `/repo`.  |
+| `CC_BAKED_REPO`       | `web/lib/server.ts`            | unset                            | `owner/repo` label for the baked checkout, shown in the UI and session records. Set from the `BAKE_REPO` build arg by the Dockerfile.                                                                   |
+| `CC_HYDRATE_ROOT`     | `preload/vfs-hydrate.ts`       | unset (preload is inert)         | Path of the blob-less working tree to hydrate into.                                                                                                                                                     |
+| `CC_HYDRATE_REPO`     | `preload/vfs-hydrate.ts`       | parsed from the `origin` remote  | `owner/repo` used for `gh api` content fetches.                                                                                                                                                         |
+| `CC_HYDRATE_REF`      | `preload/vfs-hydrate.ts`       | `HEAD`'s sha                     | Commit to hydrate file contents from.                                                                                                                                                                   |
+| `CC_HYDRATE_STRATEGY` | `preload/vfs-hydrate.ts`       | `gh`                             | How contents are fetched: `gh` (GitHub contents API) or `git` (promisor lazy fetch). See [Hydration Strategies](#hydration-strategies).                                                                 |
+| `CC_RESOURCES_ROOT`   | `scripts/lib/runtime-paths.ts` | unset (resolve from source tree) | Directory containing copies of `preload/` and the agent SDK (`claude-agent-sdk/cli.js`). Set by the packaged desktop app (`desktop/index.ts`), where import.meta-relative paths don't survive bundling. |
 
 The `CC_HYDRATE_*` vars are set automatically by `planRemoteRepo()` for the child claude process — you only set them yourself when wiring up `preload/vfs-hydrate.ts` manually (see [Configuration](#configuration)). The `CC_BAKED_*` vars configure the web server's repo mode and are normally set by the Dockerfile.
 
@@ -433,27 +452,33 @@ cc-planner/
 ├── package.json
 ├── tsconfig.json
 ├── vite.config.ts              # Vite build + dev server (PWA plugin, /ws proxy)
+├── electrobun.config.ts        # macOS app build (bundle layout, copied resources)
 ├── README.md
 ├── Dockerfile                  # Web TTY image; BAKE_REPO arg bakes a repo in
+├── icon.iconset/               # macOS app icons (generated, converted by iconutil)
+├── desktop/
+│   └── index.ts                # macOS app entry: embeds the server, opens a window
 ├── preload/
 │   ├── vfs-virtual.ts          # In-memory VFS for plan files
 │   └── vfs-hydrate.ts          # On-demand hydration over blob-less clones
 ├── scripts/
 │   ├── sdk-example.ts          # Runnable SDK example (sandbox-safe)
 │   ├── plan-remote-repo.ts     # Plan against a repo without cloning it
-│   ├── generate-icons.ts       # Regenerates the PWA icons (no image deps)
+│   ├── generate-icons.ts       # Regenerates the PWA + macOS icons (no image deps)
 │   ├── lib/
 │   │   ├── plan-remote.ts      # planRemoteRepo() — lazy-hydration sessions
 │   │   ├── plan-baked.ts       # planBakedRepo() — baked-checkout sessions
 │   │   ├── blobless-clone.ts   # Internal: blob-less clone helper
 │   │   ├── child-env.ts        # Internal: sandbox auth env fixups
+│   │   ├── runtime-paths.ts    # Internal: preload/CLI paths (packaged override)
 │   │   └── spawn-vfs.ts        # Internal: SDK spawn fn with preloads
 │   ├── vfs-virtual.test.ts     # Bun test suite (plan-file VFS)
 │   └── vfs-hydrate.test.ts     # Bun test suite (hydrating VFS, offline)
 └── web/
-    ├── server.ts               # Bun HTTP + WebSocket server (serves dist/)
+    ├── server.ts               # Standalone CLI entry for the server
     ├── index.html              # Vite entry
     ├── lib/
+    │   ├── server.ts           # Bun HTTP + WebSocket server (embeddable)
     │   ├── protocol.ts         # Browser <-> server message types
     │   ├── pricing.ts          # Public token pricing for cost estimates
     │   └── session.ts          # ClaudeSession: SDK <-> browser bridge

@@ -7,3 +7,7 @@ dist
 validation-results.json
 tsconfig.tsbuildinfo
 web/dist
+
+# electrobun build output
+build
+artifacts
