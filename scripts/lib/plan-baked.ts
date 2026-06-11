@@ -39,6 +39,10 @@ export interface BakedPlanOptions {
   appendSystemPrompt?: string;
   /** Hook callbacks (e.g. a PreToolUse hook gating Bash commands). */
   hooks?: Partial<Record<HookEvent, HookCallbackMatcher[]>>;
+  /** Tools that execute without permission prompts (supports Bash(...) patterns). */
+  allowedTools?: string[];
+  /** Tools removed from the session entirely. */
+  disallowedTools?: string[];
   /** Called with the plan content whenever a plan file is finalized. */
   onPlan?: (content: string, filename: string) => void;
   /** Called for every VFS IPC message (vfs_write, plan_file_write, ...). */
@@ -92,6 +96,8 @@ export function planBakedRepo(options: BakedPlanOptions): BakedPlanSession {
       executable: "bun",
       cwd: options.root,
       hooks: options.hooks,
+      allowedTools: options.allowedTools,
+      disallowedTools: options.disallowedTools,
       canUseTool: options.canUseTool,
       abortController: options.abortController,
       spawnClaudeCodeProcess: makeSpawnWithPreloads([VFS_VIRTUAL], handleMessage),

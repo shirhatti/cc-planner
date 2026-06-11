@@ -16,6 +16,9 @@ export interface StartSessionDetail {
   prompt: string;
   mode: SessionMode;
   stopOnPlanApproval: boolean;
+  appendSystemPrompt: string;
+  allowedTools: string[];
+  disallowedTools: string[];
 }
 
 const MODE_OPTIONS: { value: SessionMode; label: string }[] = [
@@ -62,6 +65,24 @@ export class CcStartForm extends HTMLElement {
         </div>
         <textarea class="prompt" rows="3"
           placeholder="What should Claude do? This starts the session — you can keep chatting after."></textarea>
+        <details class="advanced">
+          <summary class="muted">Advanced</summary>
+          <label>
+            <span class="muted">Extra system prompt (appended to Claude Code's)</span>
+            <textarea class="append-prompt" rows="2"
+              placeholder="e.g. Always answer in French. Keep plans under 10 bullets."></textarea>
+          </label>
+          <label>
+            <span class="muted">Always-allowed tools (comma-separated; Bash(...) patterns work)</span>
+            <input class="allowed-tools" type="text"
+              placeholder="e.g. Bash(bun test:*), WebFetch" spellcheck="false" />
+          </label>
+          <label>
+            <span class="muted">Disallowed tools (removed from the session)</span>
+            <input class="disallowed-tools" type="text"
+              placeholder="e.g. WebSearch, NotebookEdit" spellcheck="false" />
+          </label>
+        </details>
         <div class="row">
           <button type="submit">Start session</button>
           <span class="form-error muted"></span>
@@ -92,6 +113,12 @@ export class CcStartForm extends HTMLElement {
           errorEl.textContent = "Enter a repo as owner/repo";
           return;
         }
+        const csv = (selector: string): string[] =>
+          form
+            .querySelector<HTMLInputElement>(selector)!
+            .value.split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
         this.dispatchEvent(
           new CustomEvent<StartSessionDetail>("start-session", {
             bubbles: true,
@@ -101,6 +128,11 @@ export class CcStartForm extends HTMLElement {
               prompt,
               mode: modeSelect.value as SessionMode,
               stopOnPlanApproval: stopCheckbox.checked,
+              appendSystemPrompt: form
+                .querySelector<HTMLTextAreaElement>(".append-prompt")!
+                .value.trim(),
+              allowedTools: csv(".allowed-tools"),
+              disallowedTools: csv(".disallowed-tools"),
             },
           }),
         );

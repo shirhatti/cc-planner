@@ -198,6 +198,9 @@ export class CcApp extends HTMLElement {
       branch: detail.branch || undefined,
       mode: detail.mode,
       stopOnPlanApproval: detail.stopOnPlanApproval,
+      appendSystemPrompt: detail.appendSystemPrompt || undefined,
+      allowedTools: detail.allowedTools.length ? detail.allowedTools : undefined,
+      disallowedTools: detail.disallowedTools.length ? detail.disallowedTools : undefined,
       auth:
         settings.baseUrl || settings.authToken
           ? { baseUrl: settings.baseUrl, authToken: settings.authToken }

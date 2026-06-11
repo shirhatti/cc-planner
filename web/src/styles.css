@@ -710,3 +710,27 @@ select.mode {
   background: var(--good);
   opacity: 0.6;
 }
+
+/* ---- advanced session options ---- */
+
+.start-form .advanced {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.start-form .advanced summary {
+  cursor: pointer;
+}
+
+.start-form .advanced label {
+  display: block;
+  margin: 8px 0 2px;
+}
+
+.start-form .advanced label span {
+  display: block;
+  margin-bottom: 2px;
+}

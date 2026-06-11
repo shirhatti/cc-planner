@@ -92,6 +92,18 @@ export type ClientMessage =
        * Defaults to true in plan mode.
        */
       stopOnPlanApproval?: boolean;
+      /**
+       * Extra instructions appended to the Claude Code system prompt (the SDK
+       * supports append-to-preset only; there is no prepend).
+       */
+      appendSystemPrompt?: string;
+      /**
+       * Extra tools (or Bash(...) patterns) that run without permission
+       * prompts, on top of the server's read-only VFS allowlist.
+       */
+      allowedTools?: string[];
+      /** Tools removed from the session entirely. */
+      disallowedTools?: string[];
       auth?: AuthConfig;
     }
   /** A follow-up user message (multi-turn). Queued if a turn is running. */

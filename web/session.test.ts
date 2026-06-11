@@ -496,6 +496,54 @@ describe("ClaudeSession", () => {
     expect(sent.some((m) => m.type === "notice")).toBe(false);
   });
 
+  test("read-only VFS tools are always allowed without a prompt", async () => {
+    const sent: SessionEvent[] = [];
+    const results: PermissionResult[] = [];
+    let runnerArgs: Parameters<SessionRunner>[0] | undefined;
+    const runner = fakeRunner(async function* (args) {
+      runnerArgs = args;
+      for (const tool of ["Read", "Glob", "Grep", "LS"]) {
+        results.push(await args.canUseTool(tool, { file_path: "/x" }, toolOptions(`r_${tool}`)));
+      }
+      yield* [] as SDKMessage[];
+    });
+
+    const session = new ClaudeSession((msg) => sent.push(msg), runner);
+    await session.start({ prompt: "p", mode: "default" });
+
+    // Passed to the CLI as allowedTools (no prompt at all)...
+    expect(runnerArgs?.allowedTools).toEqual(
+      expect.arrayContaining(["Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite"]),
+    );
+    // ...and short-circuited in canUseTool as a fallback.
+    expect(results.every((r) => r.behavior === "allow")).toBe(true);
+    expect(sent.filter((m) => m.type === "permission_request")).toHaveLength(0);
+  });
+
+  test("session options merge user tool lists and system prompt append", async () => {
+    let runnerArgs: Parameters<SessionRunner>[0] | undefined;
+    const runner = fakeRunner(async function* (args) {
+      runnerArgs = args;
+      yield* [] as SDKMessage[];
+    });
+
+    const session = new ClaudeSession(() => {}, runner, { hydratingWorkspace: true });
+    await session.start({
+      prompt: "p",
+      appendSystemPrompt: "Answer in French.",
+      allowedTools: ["Bash(bun test:*)", "Read"],
+      disallowedTools: ["WebSearch"],
+    });
+
+    // User allowlist merges with (and dedupes against) the read-only set.
+    expect(runnerArgs?.allowedTools).toContain("Bash(bun test:*)");
+    expect(runnerArgs?.allowedTools?.filter((t) => t === "Read")).toHaveLength(1);
+    expect(runnerArgs?.disallowedTools).toEqual(["WebSearch"]);
+    // Hydration guidance and user instructions compose in the append.
+    expect(runnerArgs?.appendSystemPrompt).toContain("blob-less git clone");
+    expect(runnerArgs?.appendSystemPrompt).toContain("Answer in French.");
+  });
+
   test("user messages stream into the session until end_session", async () => {
     const received: string[] = [];
     const runner: SessionRunner = (args) => {

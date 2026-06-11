@@ -104,6 +104,9 @@ const server = Bun.serve<SocketData, never>({
             branch: msg.branch,
             mode: msg.mode,
             stopOnPlanApproval: msg.stopOnPlanApproval,
+            appendSystemPrompt: msg.appendSystemPrompt,
+            allowedTools: msg.allowedTools,
+            disallowedTools: msg.disallowedTools,
             auth: msg.auth,
           })
           .finally(() => ws.data.sessions.delete(sessionId));

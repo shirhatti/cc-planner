@@ -125,6 +125,8 @@ export interface RunnerArgs {
   permissionMode?: PermissionMode;
   appendSystemPrompt?: string;
   hooks?: Partial<Record<HookEvent, HookCallbackMatcher[]>>;
+  allowedTools?: string[];
+  disallowedTools?: string[];
   repo?: string;
   branch?: string;
   canUseTool: CanUseTool;
@@ -272,8 +274,19 @@ export interface StartRequest {
   branch?: string;
   mode?: SessionMode;
   stopOnPlanApproval?: boolean;
+  appendSystemPrompt?: string;
+  allowedTools?: string[];
+  disallowedTools?: string[];
   auth?: AuthConfig;
 }
+
+/**
+ * Tools answered entirely by the VFS layer (manifest-backed listings and
+ * on-demand reads) plus side-effect-free bookkeeping. These never require a
+ * permission prompt, in any permission mode: they are passed to the CLI as
+ * allowedTools and short-circuited in canUseTool as a fallback.
+ */
+export const READ_ONLY_TOOLS = ["Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite"];
 
 export interface ClaudeSessionOptions {
   /**
@@ -320,14 +333,23 @@ export class ClaudeSession {
     this.stopOnPlanApproval = mode === "plan" && (req.stopOnPlanApproval ?? true);
     this.input.push(req.prompt);
 
+    // Compose the system-prompt append: hydration guidance (when the
+    // workspace is lazy) plus any user-provided instructions.
+    const appendParts = [
+      this.options.hydratingWorkspace ? HYDRATION_GUIDANCE : undefined,
+      req.appendSystemPrompt?.trim() || undefined,
+    ].filter((part): part is string => Boolean(part));
+
     try {
       const { session, repo, ref } = this.runner({
         prompt: this.input,
         permissionMode: mode,
-        appendSystemPrompt: this.options.hydratingWorkspace ? HYDRATION_GUIDANCE : undefined,
+        appendSystemPrompt: appendParts.length ? appendParts.join("\n\n") : undefined,
         hooks: this.options.hydratingWorkspace
           ? { PreToolUse: [{ matcher: "Bash", hooks: [this.bashPolicyHook] }] }
           : undefined,
+        allowedTools: [...new Set([...READ_ONLY_TOOLS, ...(req.allowedTools ?? [])])],
+        disallowedTools: req.disallowedTools?.length ? req.disallowedTools : undefined,
         repo: req.repo,
         branch: req.branch,
         extraEnv: gatewayEnv(req.auth),
@@ -466,6 +488,13 @@ export class ClaudeSession {
         return { behavior: "allow", updatedInput: input };
       }
       return { behavior: "deny", message: decision?.feedback?.trim() || REJECTION_FALLBACK };
+    }
+
+    // Read-only VFS tools never need a prompt; allowedTools already covers
+    // them, but short-circuit here too in case the CLI still asks (e.g. for
+    // a path outside the workspace).
+    if (READ_ONLY_TOOLS.includes(toolName)) {
+      return { behavior: "allow", updatedInput: input };
     }
 
     // On lazily-hydrated workspaces, gate Bash commands that walk the tree

@@ -45,6 +45,10 @@ export interface RemotePlanOptions {
   appendSystemPrompt?: string;
   /** Hook callbacks (e.g. a PreToolUse hook gating Bash commands). */
   hooks?: Partial<Record<HookEvent, HookCallbackMatcher[]>>;
+  /** Tools that execute without permission prompts (supports Bash(...) patterns). */
+  allowedTools?: string[];
+  /** Tools removed from the session entirely. */
+  disallowedTools?: string[];
   /**
    * How file contents are fetched: "gh" uses the GitHub contents API,
    * "git" lazily fetches blobs from the promisor remote. Defaults to "gh"
@@ -103,6 +107,8 @@ export function planRemoteRepo(options: RemotePlanOptions): RemotePlanSession {
       executable: "bun",
       cwd: root,
       hooks: options.hooks,
+      allowedTools: options.allowedTools,
+      disallowedTools: options.disallowedTools,
       canUseTool: options.canUseTool,
       abortController: options.abortController,
       spawnClaudeCodeProcess: makeSpawnWithPreloads([VFS_VIRTUAL, VFS_HYDRATE], handleMessage),
