@@ -6,8 +6,10 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "fs";
 import { tmpdir } from "os";
@@ -473,6 +475,31 @@ test("hydrating VFS - unlinking a hydrated file makes it disappear", async () =>
   expect(stdout).toContain("read:ENOENT");
   expect(stdout).toContain("stat:ENOENT");
   expect(ghCalls(fixture).length).toBe(1);
+});
+
+test("hydrating VFS - serves the tree through a symlinked root and its real path", async () => {
+  // macOS: tmpdir() is /var/folders/..., a symlink Claude Code realpaths to
+  // /private/var/folders/... — both spellings must hit the VFS.
+  const fixture = freshClone();
+  const link = path.join(workDir, `link-${cloneCounter}`);
+  symlinkSync(fixture.root, link);
+  fixture.env.CC_HYDRATE_ROOT = link;
+  const real = realpathSync(fixture.root);
+
+  const { exitCode, stdout } = await runHydrated(
+    `
+    const fs = require('fs');
+    console.log("real:" + fs.readFileSync(${JSON.stringify(path.join(real, "src", "index.ts"))}, "utf-8").trim());
+    console.log("link:" + fs.readFileSync(${JSON.stringify(path.join(link, "README.md"))}, "utf-8").trim());
+    console.log("ls:" + fs.readdirSync(${JSON.stringify(path.join(real, "src"))}).sort().join(","));
+  `,
+    fixture,
+  );
+
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain("real:export const answer = 42;");
+  expect(stdout).toContain("link:# Widgets");
+  expect(stdout).toContain("ls:index.ts,util");
 });
 
 test("hydrating VFS - readdirSync lists the manifest without fetching blobs", async () => {

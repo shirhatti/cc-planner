@@ -66,6 +66,11 @@ describe("evaluateBashCommand (hydrating workspace)", () => {
     expect(verdict("git log --oneline -10")).toBe("allow");
     expect(verdict("git show HEAD:package.json")).toBe("allow");
     expect(verdict("git ls-tree -r --name-only HEAD")).toBe("allow");
+    // Global options before the subcommand, and a cd prefix, as Claude writes them
+    expect(verdict("git -C /tmp/cc-planner-abc ls-tree -r --name-only HEAD")).toBe("allow");
+    expect(verdict("git --no-pager ls-tree HEAD src/")).toBe("allow");
+    expect(verdict("git --git-dir=/r/.git --work-tree /r ls-tree HEAD")).toBe("allow");
+    expect(verdict("cd /tmp/cc-planner-abc && git ls-tree -r HEAD | grep vite")).toBe("allow");
     expect(verdict("git diff HEAD~1")).toBe("allow");
   });
 
@@ -79,6 +84,14 @@ describe("evaluateBashCommand (hydrating workspace)", () => {
     expect(verdict("pwd && find . -name '*.ts'")).toBe("deny");
     expect(verdict("git log; cat README.md")).toBe("deny");
     expect(verdict("echo a && git push")).toBe("ask");
+  });
+
+  test("git config overrides can run programs, so they ask", () => {
+    expect(verdict("git -c core.pager=evil log")).toBe("ask");
+    expect(verdict("git -c core.fsmonitor=evil ls-tree HEAD")).toBe("ask");
+    expect(verdict("git --config-env=core.pager=X ls-tree HEAD")).toBe("ask");
+    expect(verdict("git --exec-path=/tmp/x ls-tree HEAD")).toBe("ask");
+    expect(bakedVerdict("git -c core.pager=evil ls-tree HEAD")).toBe("ask");
   });
 
   test("unknown or mutating commands fall through to ask", () => {

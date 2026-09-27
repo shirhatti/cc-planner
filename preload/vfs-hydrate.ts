@@ -54,6 +54,10 @@ if (process.env.CC_HYDRATE_ROOT) {
 
 function install(rootInput: string): void {
   const ROOT = path.resolve(rootInput);
+  // The same tree can be addressed through a symlinked prefix — on macOS
+  // tmpdir() is /var/folders/..., which Claude Code realpaths to
+  // /private/var/folders/... — so match paths under either spelling.
+  const ROOT_ALIASES = [...new Set([ROOT, fs.realpathSync(ROOT) as string])];
 
   function git(args: string[]): string {
     const res = spawnSync("git", ["-C", ROOT, ...args], {
@@ -203,8 +207,9 @@ function install(rootInput: string): void {
   function relUnderRoot(p: unknown): string | null {
     if (typeof p !== "string" || p.length === 0) return null;
     const resolved = path.resolve(p);
-    if (resolved !== ROOT && !resolved.startsWith(ROOT + path.sep)) return null;
-    const rel = path.relative(ROOT, resolved);
+    const root = ROOT_ALIASES.find((r) => resolved === r || resolved.startsWith(r + path.sep));
+    if (root === undefined) return null;
+    const rel = path.relative(root, resolved);
     if (rel === ".git" || rel.startsWith(".git" + path.sep)) return null;
     return rel;
   }

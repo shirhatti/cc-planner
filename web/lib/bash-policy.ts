@@ -55,7 +55,17 @@ const GIT_SAFE = new Set([
 ]);
 
 /** Commands that are always safe and need no permission round-trip. */
-const ALWAYS_SAFE = new Set(["pwd", "echo", "true", "which", "basename", "dirname", "date", "ls"]);
+const ALWAYS_SAFE = new Set([
+  "pwd",
+  "cd",
+  "echo",
+  "true",
+  "which",
+  "basename",
+  "dirname",
+  "date",
+  "ls",
+]);
 
 /**
  * Read-only shell commands. Auto-allowed on full checkouts; on hydrating
@@ -98,13 +108,56 @@ function hasWriteRedirect(segment: string): boolean {
 /** find flags that execute commands or delete files. */
 const FIND_MUTATING_FLAGS = new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint"]);
 
+/** git global options that take a separate value (`git -C <path> ...`). */
+const GIT_GLOBAL_OPTS_WITH_VALUE = new Set([
+  "-C",
+  "-c",
+  "--git-dir",
+  "--work-tree",
+  "--namespace",
+  "--exec-path",
+  "--config-env",
+]);
+
+/**
+ * git global options that can make any subcommand run arbitrary programs
+ * (`-c core.pager=...`, `-c core.fsmonitor=...`, a swapped exec path).
+ */
+const GIT_EXEC_CAPABLE_OPTS = /^(-c|--config-env|--exec-path)(=|$)/;
+
+/**
+ * Drop git's global options so the subcommand comes first:
+ * `git -C /repo --no-pager ls-tree HEAD` → `ls-tree HEAD`.
+ */
+function stripGitGlobalOptions(tokens: string[]): { rest: string[]; execCapable: boolean } {
+  let i = 0;
+  let execCapable = false;
+  while (i < tokens.length && tokens[i].startsWith("-")) {
+    const opt = tokens[i];
+    if (GIT_EXEC_CAPABLE_OPTS.test(opt)) execCapable = true;
+    i += GIT_GLOBAL_OPTS_WITH_VALUE.has(opt) ? 2 : 1;
+  }
+  return { rest: tokens.slice(i), execCapable };
+}
+
 /** Tokenize one pipeline segment, tracking flags vs. positional args. */
-function parseSegment(segment: string): { cmd: string; flags: string[]; args: string[] } {
-  const tokens = segment.trim().split(/\s+/).filter(Boolean);
+function parseSegment(segment: string): {
+  cmd: string;
+  flags: string[];
+  args: string[];
+  gitExecCapable: boolean;
+} {
+  let tokens = segment.trim().split(/\s+/).filter(Boolean);
   // Skip env-var prefixes (FOO=bar cmd ...).
   while (tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) tokens.shift();
 
   const cmd = tokens.shift() ?? "";
+  let gitExecCapable = false;
+  if (cmd.replace(/^.*\//, "") === "git") {
+    const stripped = stripGitGlobalOptions(tokens);
+    tokens = stripped.rest;
+    gitExecCapable = stripped.execCapable;
+  }
   const flags: string[] = [];
   const args: string[] = [];
   let prevWasFlag = false;
@@ -120,15 +173,16 @@ function parseSegment(segment: string): { cmd: string; flags: string[]; args: st
       prevWasFlag = false;
     }
   }
-  return { cmd: cmd.replace(/^.*\//, ""), flags, args };
+  return { cmd: cmd.replace(/^.*\//, ""), flags, args, gitExecCapable };
 }
 
 function evaluateSegment(segment: string, hydrating: boolean): BashPolicyResult {
-  const { cmd, flags, args } = parseSegment(segment);
+  const { cmd, flags, args, gitExecCapable } = parseSegment(segment);
   if (!cmd) return { verdict: "allow" };
 
-  // Writes via redirection are never auto-allowed, in any workspace.
-  if (hasWriteRedirect(segment)) return { verdict: "ask" };
+  // Writes via redirection are never auto-allowed, in any workspace; nor is
+  // git with config overrides, which can run arbitrary programs.
+  if (hasWriteRedirect(segment) || gitExecCapable) return { verdict: "ask" };
 
   if (cmd === "find" && flags.some((f) => FIND_MUTATING_FLAGS.has(f))) {
     return hydrating
