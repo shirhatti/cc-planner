@@ -55,8 +55,8 @@ for await (const msg of session) {
       console.log(
         `[sdk] assistant:`,
         msg.message.content
-          .filter((b): b is { type: "text"; text: string } => b.type === "text")
-          .map((b) => b.text)
+          .filter((b: { type: string }): b is { type: "text"; text: string } => b.type === "text")
+          .map((b: { text: string }) => b.text)
           .join(""),
       );
       break;

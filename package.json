@@ -12,6 +12,7 @@
     "app:dev": "bun run build && electrobun dev",
     "app:build": "bun run build && electrobun build --env=stable",
     "test": "bun test",
+    "typecheck": "tsc --noEmit",
     "lint": "eslint desktop/ preload/ scripts/ web/ vite.config.ts electrobun.config.ts",
     "lint:fix": "eslint --fix desktop/ preload/ scripts/ web/ vite.config.ts electrobun.config.ts",
     "format": "prettier --write desktop/ preload/ scripts/ web/ vite.config.ts electrobun.config.ts",

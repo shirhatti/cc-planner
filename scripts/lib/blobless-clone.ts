@@ -32,10 +32,15 @@ function run(cmd: string, args: string[]): string {
   return res.stdout;
 }
 
-/** Whether a usable `gh` CLI is on PATH. */
+let ghAvailableCache: boolean | undefined;
+
+/** Whether a usable `gh` CLI is on PATH (probed once per process). */
 export function ghAvailable(): boolean {
-  const res = spawnSync("gh", ["--version"], { stdio: "ignore" });
-  return !res.error && res.status === 0;
+  if (ghAvailableCache === undefined) {
+    const res = spawnSync("gh", ["--version"], { stdio: "ignore" });
+    ghAvailableCache = !res.error && res.status === 0;
+  }
+  return ghAvailableCache;
 }
 
 export function bloblessClone(repo: string, dest: string, branch?: string): BloblessClone {
