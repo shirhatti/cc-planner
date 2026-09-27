@@ -7,6 +7,11 @@ A hydrating Virtual File System (VFS) for Claude Code's Plan Mode, injected as a
 
 Every session is a **planning session**: it runs in plan mode and ends when the plan is approved — the approved plan is the deliverable.
 
+Plan mode alone only makes Claude read-only; given a request that reads like a question, Claude may just answer. To keep every session ending in a plan (`scripts/lib/plan-workflow.ts`):
+
+- **Planning instructions** replace plan mode's default workflow text (the SDK's `planModeInstructions`): explore, ask clarifying questions with AskUserQuestion, write the plan (answering any question in its context section), and always finish with ExitPlanMode.
+- **A Stop hook** blocks Claude from ending a turn before it has submitted a plan (or after a plan was rejected), sending it back to write one. It blocks once per stop attempt — the retry is always allowed — so it can't loop.
+
 On top of this infra, `web/` provides a **browser client for Claude Code planning sessions** — multi-turn sessions, browser-side permissions, diffs, plan review — see [Web TTY](#web-tty).
 
 ## Overview
@@ -85,6 +90,9 @@ The launcher (`scripts/claude-vfs.ts`) makes a blob-less clone into a temp direc
 - `plansDirectory` — plan files stay inside the throwaway clone's `.git` dir.
 - A **PreToolUse** hook on Bash → `scripts/bash-policy-hook.ts`, which applies the web app's [Bash policy](#web-tty) (`web/lib/bash-policy.ts`): read-only commands like `git ls-tree` run without prompts and VFS-hostile ones are denied with guidance.
 - A **PostToolUse** hook on ExitPlanMode → `scripts/plan-approved-hook.ts`, which writes the approved plan to `$CC_PLANNER_APPROVED_FILE` and returns `continue: false`. The launcher then stops the CLI and prints the plan.
+- A **Stop** hook → `scripts/plan-stop-hook.ts` (interactive sessions only), which sends Claude back to write a plan if it tries to finish without one.
+
+The planning instructions are passed with `--plan-mode-instructions` in `-p` mode (the CLI only accepts it there) and with `--append-system-prompt` in interactive sessions.
 
 Everything after `--` is passed to `claude` verbatim, except that sessions are plan-only: `--permission-mode` other than `plan`, `--settings`, and `--dangerously-skip-permissions` are rejected. In `-p` print mode there is no one to approve a plan, so ExitPlanMode isn't available and the plan is the final answer. Your existing login and settings (`~/.claude`) apply as usual.
 
@@ -428,6 +436,7 @@ cc-planner/
 │   ├── claude-vfs.ts           # Plain Claude Code CLI on a lazily-hydrated workspace
 │   ├── bash-policy-hook.ts     # PreToolUse Bash hook for the launcher (bash policy)
 │   ├── plan-approved-hook.ts   # PostToolUse ExitPlanMode hook: ends the session
+│   ├── plan-stop-hook.ts       # Stop hook: no finishing without a plan
 │   ├── sdk-example.ts          # Runnable SDK example (sandbox-safe)
 │   ├── plan-remote-repo.ts     # Plan against a repo without cloning it
 │   ├── generate-icons.ts       # Regenerates the PWA + macOS icons (no image deps)
@@ -436,6 +445,7 @@ cc-planner/
 │   │   ├── plan-baked.ts       # planBakedRepo() — baked-checkout sessions
 │   │   ├── run-session.ts      # runSession(): shared SDK query setup for both
 │   │   ├── plan-capture.ts     # plansDirectory setting + plan-capture hook
+│   │   ├── plan-workflow.ts    # Planning instructions + Stop-hook decision
 │   │   ├── blobless-clone.ts   # Internal: blob-less clone helper
 │   │   ├── child-env.ts        # Internal: sandbox auth env fixups
 │   │   ├── runtime-paths.ts    # Internal: preload/native binary paths (packaged override)

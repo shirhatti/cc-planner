@@ -498,7 +498,7 @@ describe("ClaudeSession", () => {
     const runner: SessionRunner = (args) => {
       const gen = (async function* () {
         const matchers = args.hooks?.PreToolUse ?? [];
-        const taskHook = matchers.find((m) => m.matcher === "Task")?.hooks[0];
+        const taskHook = matchers.find((m) => m.matcher === "Task|Agent")?.hooks[0];
         expect(taskHook).toBeDefined();
         const signal = new AbortController().signal;
         hookOutputs.push(
@@ -580,6 +580,65 @@ describe("ClaudeSession", () => {
     expect(results[1]?.behavior).toBe("allow");
     expect(sent.filter((m) => m.type === "permission_request")).toHaveLength(1);
     expect(sent.some((m) => m.type === "notice")).toBe(false);
+  });
+
+  test("plan-only: Stop is blocked until ExitPlanMode was called, once per attempt", async () => {
+    const outputs: unknown[] = [];
+    let runnerArgs: Parameters<SessionRunner>[0] | undefined;
+    const runner = fakeRunner(async function* (args) {
+      runnerArgs = args;
+      const stop = args.hooks?.Stop?.[0]?.hooks[0];
+      const fire = (active: boolean) =>
+        stop!({ hook_event_name: "Stop", stop_hook_active: active } as never, undefined, {
+          signal: new AbortController().signal,
+        });
+      // Answered without planning → sent back to write the plan...
+      outputs.push(await fire(false));
+      // ...but the retry itself is never blocked (no loops).
+      outputs.push(await fire(true));
+      // A rejected plan must be resubmitted before stopping.
+      await args.canUseTool("ExitPlanMode", { plan: "# P" }, toolOptions("tu_x"));
+      outputs.push(await fire(false));
+      yield* [] as SDKMessage[];
+    });
+
+    const session: ClaudeSession = new ClaudeSession((msg) => {
+      if (msg.type === "plan_review") {
+        session.handleClientMessage({
+          type: "plan_decision",
+          sessionId: "s1",
+          id: msg.id,
+          approved: false,
+          feedback: "more detail",
+        });
+      }
+    }, runner);
+    await session.start({ prompt: "p" });
+
+    expect(runnerArgs?.planModeInstructions).toContain(
+      "Never end your turn without calling ExitPlanMode",
+    );
+    expect(outputs[0]).toMatchObject({ decision: "block" });
+    expect(outputs[1]).toEqual({});
+    expect(outputs[2]).toMatchObject({ decision: "block" });
+  });
+
+  test("plan-only: Stop is allowed while a submitted plan awaits review", async () => {
+    let output: unknown;
+    const runner = fakeRunner(async function* (args) {
+      const stop = args.hooks?.Stop?.[0]?.hooks[0];
+      const review = args.canUseTool("ExitPlanMode", { plan: "# P" }, toolOptions("tu_y"));
+      output = await stop!(
+        { hook_event_name: "Stop", stop_hook_active: false } as never,
+        undefined,
+        { signal: new AbortController().signal },
+      );
+      void review.catch(() => {});
+      yield* [] as SDKMessage[];
+    });
+    const session = new ClaudeSession(() => {}, runner);
+    await session.start({ prompt: "p" });
+    expect(output).toEqual({});
   });
 
   test("read-only VFS tools are always allowed without a prompt", async () => {

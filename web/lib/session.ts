@@ -29,6 +29,7 @@ import type {
 import { planBakedRepo, resolveBakedRef } from "../../scripts/lib/plan-baked";
 import { planRemoteRepo } from "../../scripts/lib/plan-remote";
 import type { VfsMessage } from "../../scripts/lib/spawn-vfs";
+import { PLAN_WORKFLOW_INSTRUCTIONS, stopDecision } from "../../scripts/lib/plan-workflow";
 import { evaluateBashCommand, HYDRATION_GUIDANCE } from "./bash-policy";
 import { estimateModelCostUsd } from "./pricing";
 import type {
@@ -125,6 +126,7 @@ export interface RunnerArgs {
   prompt: string | AsyncIterable<SDKUserMessage>;
   permissionMode?: PermissionMode;
   appendSystemPrompt?: string;
+  planModeInstructions?: string;
   hooks?: Partial<Record<HookEvent, HookCallbackMatcher[]>>;
   allowedTools?: string[];
   disallowedTools?: string[];
@@ -335,6 +337,8 @@ export class ClaudeSession {
   private session?: RunnerResult["session"];
   private started = false;
   private planApproved = false;
+  /** ExitPlanMode was called since the last user message or rejection. */
+  private planSubmitted = false;
   /** Filename of the last plan file reported, so the review keeps its name. */
   private planFilename = "plan.md";
   private startedAt = 0;
@@ -379,7 +383,10 @@ export class ClaudeSession {
         prompt: this.input,
         permissionMode: mode,
         appendSystemPrompt: appendParts.length ? appendParts.join("\n\n") : undefined,
+        planModeInstructions: PLAN_WORKFLOW_INSTRUCTIONS,
         hooks: {
+          // Send Claude back to plan if it tries to finish without one.
+          Stop: [{ hooks: [this.stopHook] }],
           PreToolUse: [
             // The Bash policy applies everywhere: read-only commands are
             // auto-allowed on every workspace; hydration denials only fire
@@ -387,7 +394,7 @@ export class ClaudeSession {
             // when hydrating.
             { matcher: "Bash", hooks: [this.bashPolicyHook] },
             ...(this.options.hydratingWorkspace
-              ? [{ matcher: "Task", hooks: [this.taskGuidanceHook] }]
+              ? [{ matcher: "Task|Agent", hooks: [this.taskGuidanceHook] }]
               : []),
           ],
         },
@@ -432,6 +439,7 @@ export class ClaudeSession {
   handleClientMessage(msg: ClientMessage): void {
     switch (msg.type) {
       case "user_message":
+        this.planSubmitted = false;
         this.input.push(msg.text);
         break;
       case "answer_question":
@@ -498,13 +506,26 @@ export class ClaudeSession {
   };
 
   /**
+   * Plan-only sessions end in an approved plan. If Claude tries to finish a
+   * turn without calling ExitPlanMode (e.g. it just answered a question),
+   * block the stop once and send it back to write the plan.
+   */
+  private readonly stopHook: HookCallback = async (input) => {
+    if (input.hook_event_name !== "Stop") return {};
+    return stopDecision(this.planSubmitted || this.planApproved, input.stop_hook_active);
+  };
+
+  /**
    * Subagents (Task tool) get their own prompts and never see the main
    * agent's system-prompt append — without this they rediscover the
    * workspace rules by trial and error (probing the empty worktree, trying
    * find/cat). Inject the hydration guidance into every subagent prompt.
    */
   private readonly taskGuidanceHook: HookCallback = async (input) => {
-    if (input.hook_event_name !== "PreToolUse" || input.tool_name !== "Task") {
+    if (
+      input.hook_event_name !== "PreToolUse" ||
+      (input.tool_name !== "Task" && input.tool_name !== "Agent")
+    ) {
       return {};
     }
     const toolInput = input.tool_input as Record<string, unknown> | undefined;
@@ -531,6 +552,7 @@ export class ClaudeSession {
     }
 
     if (toolName === "ExitPlanMode") {
+      this.planSubmitted = true;
       const allowedPrompts = (input.allowedPrompts ?? []) as { tool: string; prompt: string }[];
       // The CLI injects the plan-file content into the tool input. Re-emit it
       // as a plan_update so the review always has a preview — the plan file
@@ -552,6 +574,8 @@ export class ClaudeSession {
       const decision = reply.type === "plan_decision" ? reply : undefined;
       const approved = decision?.approved ?? false;
       this.send({ type: "plan_decided", approved });
+      // A rejected plan must be revised and resubmitted before stopping.
+      this.planSubmitted = approved;
 
       if (approved) {
         // The approved plan is the deliverable: allow the tool call to

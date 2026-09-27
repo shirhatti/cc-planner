@@ -24,6 +24,7 @@ import { fileURLToPath } from "url";
 import { bloblessClone, ghAvailable, hydrateEnv } from "./lib/blobless-clone";
 import { buildChildEnv } from "./lib/child-env";
 import { PLANS_SUBDIR } from "./lib/plan-capture";
+import { PLAN_WORKFLOW_INSTRUCTIONS } from "./lib/plan-workflow";
 import { claudeExecutablePath, preloadScript } from "./lib/runtime-paths";
 import { preloadEnv } from "./lib/spawn-vfs";
 
@@ -86,7 +87,11 @@ const hookCommand = (script: string): string =>
 // - Bash policy (PreToolUse): read-only commands such as git ls-tree run
 //   without a prompt; VFS-hostile ones are denied with guidance.
 // - Plan approval (PostToolUse on ExitPlanMode): ends the session.
+// - Stop (interactive only): sends Claude back to plan if it tries to finish
+//   without one. In -p mode ExitPlanMode doesn't exist (no one can
+//   approve), so the answer itself is the plan.
 // - plansDirectory: plan files stay inside the throwaway clone's .git dir.
+const printMode = claudeArgs.some((a) => a === "-p" || a === "--print");
 const settings = JSON.stringify({
   plansDirectory: PLANS_SUBDIR,
   hooks: {
@@ -102,14 +107,23 @@ const settings = JSON.stringify({
         hooks: [{ type: "command", command: hookCommand("plan-approved-hook.ts") }],
       },
     ],
+    ...(printMode
+      ? {}
+      : { Stop: [{ hooks: [{ type: "command", command: hookCommand("plan-stop-hook.ts") }] }] }),
   },
 });
+// Keep Claude planning even when a request reads like a question. The CLI
+// only accepts --plan-mode-instructions with --print; interactive sessions
+// get the same text appended to the system prompt.
+const workflowArgs = printMode
+  ? ["--plan-mode-instructions", PLAN_WORKFLOW_INSTRUCTIONS]
+  : ["--append-system-prompt", PLAN_WORKFLOW_INSTRUCTIONS];
 
 const approvedFile = path.join(mkdtempSync(path.join(tmpdir(), "cc-planner-approved-")), "plan.md");
 const baseEnv = { ...buildChildEnv(), ...hydrateEnv(clone, resolvedStrategy) };
 const child = spawn(
   claudeBin,
-  ["--permission-mode", "plan", "--settings", settings, ...claudeArgs],
+  ["--permission-mode", "plan", "--settings", settings, ...workflowArgs, ...claudeArgs],
   {
     cwd: root,
     stdio: "inherit",

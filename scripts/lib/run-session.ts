@@ -25,6 +25,8 @@ export interface SessionOptions {
   permissionMode?: PermissionMode;
   /** Extra instructions appended to the standard Claude Code system prompt. */
   appendSystemPrompt?: string;
+  /** Replaces the plan-mode workflow body of the plan-mode system reminder. */
+  planModeInstructions?: string;
   /** Hook callbacks (e.g. a PreToolUse hook gating Bash commands). */
   hooks?: Partial<Record<HookEvent, HookCallbackMatcher[]>>;
   /** Tools that execute without permission prompts (supports Bash(...) patterns). */
@@ -74,6 +76,7 @@ export function runSession(options: SessionOptions, workspace: WorkspaceConfig):
       systemPrompt: options.appendSystemPrompt
         ? { type: "preset", preset: "claude_code", append: options.appendSystemPrompt }
         : undefined,
+      planModeInstructions: options.planModeInstructions,
       pathToClaudeCodeExecutable: claudeExecutablePath(),
       cwd: workspace.cwd,
       hooks,
