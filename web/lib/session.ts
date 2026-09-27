@@ -306,8 +306,9 @@ export interface StartRequest {
 /**
  * Tools answered entirely by the VFS layer (manifest-backed listings and
  * on-demand reads) plus side-effect-free bookkeeping. These never require a
- * permission prompt, in any permission mode: they are passed to the CLI as
- * allowedTools and short-circuited in canUseTool as a fallback.
+ * permission prompt: canUseTool allows them outright. (They are deliberately
+ * not bare allowedTools entries, which would bypass canUseTool entirely —
+ * the SDK warns about that shadowing.)
  */
 export const READ_ONLY_TOOLS = ["Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite"];
 
@@ -390,7 +391,7 @@ export class ClaudeSession {
               : []),
           ],
         },
-        allowedTools: [...new Set([...READ_ONLY_TOOLS, ...(req.allowedTools ?? [])])],
+        allowedTools: req.allowedTools?.length ? req.allowedTools : undefined,
         disallowedTools: req.disallowedTools?.length ? req.disallowedTools : undefined,
         repo: req.repo,
         branch: req.branch,
@@ -562,9 +563,7 @@ export class ClaudeSession {
       return { behavior: "deny", message: decision?.feedback?.trim() || REJECTION_FALLBACK };
     }
 
-    // Read-only VFS tools never need a prompt; allowedTools already covers
-    // them, but short-circuit here too in case the CLI still asks (e.g. for
-    // a path outside the workspace).
+    // Read-only VFS tools never need a prompt.
     if (READ_ONLY_TOOLS.includes(toolName)) {
       return { behavior: "allow", updatedInput: input };
     }

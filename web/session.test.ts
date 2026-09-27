@@ -597,11 +597,9 @@ describe("ClaudeSession", () => {
     const session = new ClaudeSession((msg) => sent.push(msg), runner);
     await session.start({ prompt: "p" });
 
-    // Passed to the CLI as allowedTools (no prompt at all)...
-    expect(runnerArgs?.allowedTools).toEqual(
-      expect.arrayContaining(["Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite"]),
-    );
-    // ...and short-circuited in canUseTool as a fallback.
+    // Allowed by canUseTool, not by bare allowedTools entries (which would
+    // shadow the callback — the SDK warns CLAUDE_SDK_CAN_USE_TOOL_SHADOWED).
+    expect(runnerArgs?.allowedTools).toBeUndefined();
     expect(results.every((r) => r?.behavior === "allow")).toBe(true);
     expect(sent.filter((m) => m.type === "permission_request")).toHaveLength(0);
   });
@@ -621,9 +619,8 @@ describe("ClaudeSession", () => {
       disallowedTools: ["WebSearch"],
     });
 
-    // User allowlist merges with (and dedupes against) the read-only set.
-    expect(runnerArgs?.allowedTools).toContain("Bash(bun test:*)");
-    expect(runnerArgs?.allowedTools?.filter((t) => t === "Read")).toHaveLength(1);
+    // The user's allowlist passes through as given.
+    expect(runnerArgs?.allowedTools).toEqual(["Bash(bun test:*)", "Read"]);
     expect(runnerArgs?.disallowedTools).toEqual(["WebSearch"]);
     // Hydration guidance and user instructions compose in the append.
     expect(runnerArgs?.appendSystemPrompt).toContain("blob-less git clone");
