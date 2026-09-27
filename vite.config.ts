@@ -41,7 +41,7 @@ export default defineConfig({
       workbox: {
         // The Shiki grammars from @pierre/diffs are hundreds of hashed JS
         // chunks — cache those on demand instead of precaching everything.
-        globPatterns: ["**/*.{html,css,png,webmanifest}", "assets/main-*.js"],
+        globPatterns: ["**/*.{html,css,png,webmanifest}", "assets/index-*.js"],
         maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
         runtimeCaching: [
           {

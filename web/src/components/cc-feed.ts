@@ -16,65 +16,114 @@ export interface PermissionDecisionDetail {
   always?: boolean;
 }
 
+/** Within this many px of the bottom counts as "following" the feed. */
+const STICK_THRESHOLD_PX = 40;
+
 export class CcFeed extends HTMLElement {
   private hydrateLine: HTMLElement | null = null;
   private hydrateCount = 0;
+  /**
+   * Whether the user is following the feed (scrolled to within
+   * STICK_THRESHOLD_PX of the bottom). Tracked from scroll events rather
+   * than measured at append time, so content that grows after it lands
+   * (async diff rendering) doesn't unstick the feed. Hidden feeds get no
+   * scroll events and keep their state for when they're shown again.
+   */
+  private following = true;
 
   connectedCallback(): void {
     this.classList.add("feed");
+    this.addEventListener("scroll", this.onScroll, { passive: true });
   }
 
-  private addItem(className: string): HTMLDivElement {
+  disconnectedCallback(): void {
+    this.removeEventListener("scroll", this.onScroll);
+  }
+
+  private readonly onScroll = (): void => {
+    this.following = this.scrollHeight - this.scrollTop - this.clientHeight <= STICK_THRESHOLD_PX;
+  };
+
+  /**
+   * Run a DOM mutation, then keep the feed pinned to the bottom only if the
+   * user was following it — scrolling up to read history isn't yanked back
+   * by new output. Every feed mutation goes through here.
+   */
+  private appendAndFollow<T>(mutate: () => T): T {
+    const result = mutate();
+    if (this.following) this.scrollTop = this.scrollHeight;
+    return result;
+  }
+
+  /** Build a feed item with `fill`, then append it (following if stuck). */
+  private addItem(className: string, fill: (div: HTMLDivElement) => void): HTMLDivElement {
     const div = document.createElement("div");
     div.className = `feed-item ${className}`;
-    this.append(div);
-    this.scrollTop = this.scrollHeight;
+    fill(div);
+    this.appendAndFollow(() => this.append(div));
     return div;
   }
 
   addInfo(text: string): void {
-    this.addItem("info").textContent = text;
+    this.addItem("info", (div) => (div.textContent = text));
   }
 
   addError(text: string): void {
-    this.addItem("error-item").textContent = text;
+    this.addItem("error-item", (div) => (div.textContent = text));
   }
 
   addUserMessage(text: string): void {
-    this.addItem("user-message").textContent = text;
+    this.addItem("user-message", (div) => (div.textContent = text));
   }
 
   addAssistant(md: string): void {
-    this.addItem("assistant").innerHTML = renderMarkdown(md);
+    this.addItem("assistant", (div) => (div.innerHTML = renderMarkdown(md)));
   }
 
   addTool(name: string, detail: string, diff?: DiffPayload): void {
-    const div = this.addItem("tool");
-    const nameEl = document.createElement("span");
-    nameEl.className = "tool-name";
-    nameEl.textContent = name;
-    const detailEl = document.createElement("span");
-    detailEl.className = "tool-detail";
-    detailEl.textContent = detail ? ` ${detail}` : "";
-    div.append(nameEl, detailEl);
+    this.addItem("tool", (div) => {
+      const nameEl = document.createElement("span");
+      nameEl.className = "tool-name";
+      nameEl.textContent = name;
+      const detailEl = document.createElement("span");
+      detailEl.className = "tool-detail";
+      detailEl.textContent = detail ? ` ${detail}` : "";
+      div.append(nameEl, detailEl);
+    });
     if (diff) {
-      const diffEl = document.createElement("cc-diff");
-      this.append(diffEl);
-      diffEl.show(diff);
-      this.scrollTop = this.scrollHeight;
+      this.appendAndFollow(() => {
+        const diffEl = document.createElement("cc-diff");
+        this.append(diffEl);
+        diffEl.show(diff);
+      });
     }
   }
 
   addQuestion(id: string, questions: UserQuestion[]): void {
-    const card = document.createElement("cc-question-card");
-    this.append(card);
-    card.setData({ id, questions });
-    this.scrollTop = this.scrollHeight;
+    this.appendAndFollow(() => {
+      const card = document.createElement("cc-question-card");
+      this.append(card);
+      card.setData({ id, questions });
+    });
   }
 
   addPermission(id: string, toolName: string, detail: string, diff?: DiffPayload): void {
-    const card = this.addItem("permission-card");
+    // Built after connecting: cc-diff renders into a live container.
+    this.appendAndFollow(() => {
+      const card = document.createElement("div");
+      card.className = "feed-item permission-card";
+      this.append(card);
+      this.fillPermission(card, id, toolName, detail, diff);
+    });
+  }
 
+  private fillPermission(
+    card: HTMLDivElement,
+    id: string,
+    toolName: string,
+    detail: string,
+    diff?: DiffPayload,
+  ): void {
     const title = document.createElement("div");
     title.className = "permission-title";
     const chip = document.createElement("span");
@@ -124,14 +173,18 @@ export class CcFeed extends HTMLElement {
     denyBtn.onclick = () => decide(false);
     row.append(allowBtn, alwaysBtn, denyBtn);
     card.append(row);
-    this.scrollTop = this.scrollHeight;
   }
 
   hydrateProgress(rel: string): void {
     this.hydrateCount += 1;
-    if (!this.hydrateLine) this.hydrateLine = this.addItem("info");
     const plural = this.hydrateCount === 1 ? "" : "s";
-    this.hydrateLine.textContent = `Hydrated ${this.hydrateCount} file${plural} (latest: ${rel})`;
+    const text = `Hydrated ${this.hydrateCount} file${plural} (latest: ${rel})`;
+    if (this.hydrateLine) {
+      const line = this.hydrateLine;
+      this.appendAndFollow(() => (line.textContent = text));
+    } else {
+      this.hydrateLine = this.addItem("info", (div) => (div.textContent = text));
+    }
   }
 }
 

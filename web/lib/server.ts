@@ -21,14 +21,26 @@
 import { existsSync } from "fs";
 import path from "path";
 import type { ServerWebSocket } from "bun";
-import type { ClientMessage, ServerMessage } from "./protocol";
+import type { ServerMessage } from "./protocol";
 import { ClaudeSession, makeRunner, resolveRepoMode } from "./session";
+import { isAllowedOrigin, sanitizeSessionMessage, sanitizeStartMessage } from "./validate";
 
 export interface StartServerOptions {
   /** Port to listen on; 0 picks an ephemeral port. */
   port: number;
   /** Directory containing the built UI (Vite build output). */
   distDir: string;
+  /**
+   * Interface to bind. Defaults to loopback ("127.0.0.1") — the server runs
+   * claude sessions with the host's credentials and filesystem, so exposing
+   * it is an explicit opt-in (e.g. "0.0.0.0" inside a container).
+   */
+  hostname?: string;
+  /**
+   * Extra browser origins (scheme://host[:port]) allowed to open the
+   * WebSocket, beyond same-origin pages served by this server.
+   */
+  allowedOrigins?: string[];
 }
 
 export interface WebTtyServer {
@@ -43,7 +55,9 @@ interface SocketData {
 }
 
 export function startServer(options: StartServerOptions): WebTtyServer {
-  const distDir = options.distDir;
+  const distDir = path.resolve(options.distDir);
+  const hostname = options.hostname ?? "127.0.0.1";
+  const allowedOrigins = options.allowedOrigins ?? [];
   const repoMode = resolveRepoMode();
   const runner = makeRunner(repoMode);
 
@@ -51,26 +65,40 @@ export function startServer(options: StartServerOptions): WebTtyServer {
     if (!existsSync(distDir)) {
       return new Response("UI build not found — run `bun run build` first.", { status: 503 });
     }
-    const rel = pathname === "/" ? "index.html" : pathname.slice(1);
-    const filePath = path.join(distDir, rel);
-    if (!path.normalize(filePath).startsWith(distDir + path.sep)) {
+    let rel: string;
+    try {
+      rel = decodeURIComponent(pathname === "/" ? "index.html" : pathname.slice(1));
+    } catch {
+      return new Response("Bad request", { status: 400 });
+    }
+    const filePath = path.resolve(distDir, rel);
+    if (!filePath.startsWith(distDir + path.sep)) {
       return new Response("Forbidden", { status: 403 });
     }
     const file = Bun.file(filePath);
     if (!(await file.exists())) {
       return new Response("Not found", { status: 404 });
     }
+    const headers: Record<string, string> = {
+      "cache-control": cacheControlFor(path.relative(distDir, filePath)),
+    };
     if (filePath.endsWith(".webmanifest")) {
-      return new Response(file, { headers: { "content-type": "application/manifest+json" } });
+      headers["content-type"] = "application/manifest+json";
     }
-    return new Response(file);
+    return new Response(file, { headers });
   }
 
   const server = Bun.serve<SocketData, never>({
     port: options.port,
+    hostname,
     fetch(req, server) {
       const url = new URL(req.url);
       if (url.pathname === "/ws") {
+        // Cross-site WebSocket hijacking defense: any page the user visits
+        // could otherwise drive sessions on this server.
+        if (!isAllowedOrigin(req.headers.get("origin"), req.headers.get("host"), allowedOrigins)) {
+          return new Response("Forbidden origin", { status: 403 });
+        }
         return server.upgrade(req, { data: { sessions: new Map() } })
           ? undefined
           : new Response("WebSocket upgrade failed", { status: 400 });
@@ -87,12 +115,16 @@ export function startServer(options: StartServerOptions): WebTtyServer {
         });
       },
       message(ws: ServerWebSocket<SocketData>, raw) {
-        let msg: ClientMessage;
+        let parsed: unknown;
         try {
-          msg = JSON.parse(String(raw)) as ClientMessage;
+          parsed = JSON.parse(String(raw));
         } catch {
           return;
         }
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          return;
+        }
+        const msg = parsed as Record<string, unknown>;
         if (typeof msg.sessionId !== "string" || !msg.sessionId) {
           return;
         }
@@ -103,35 +135,29 @@ export function startServer(options: StartServerOptions): WebTtyServer {
             sendTo(ws, { type: "error", sessionId, message: "Session already started" });
             return;
           }
-          const localPath = typeof msg.localPath === "string" ? msg.localPath.trim() : "";
+          const request = sanitizeStartMessage(msg);
+          if (!request.ok) {
+            sendTo(ws, { type: "error", sessionId, message: request.error });
+            sendTo(ws, { type: "session_done", sessionId });
+            return;
+          }
           const session = new ClaudeSession(
             (event) => sendTo(ws, { ...event, sessionId }),
             runner,
             {
               // Local-path sessions are full checkouts — no hydration.
-              hydratingWorkspace: repoMode.mode === "lazy" && !localPath,
+              hydratingWorkspace: repoMode.mode === "lazy" && !request.value.localPath,
             },
           );
           ws.data.sessions.set(sessionId, session);
-          void session
-            .start({
-              prompt: msg.prompt,
-              repo: msg.repo,
-              branch: msg.branch,
-              localPath: localPath || undefined,
-              strategy: msg.strategy === "gh" || msg.strategy === "git" ? msg.strategy : undefined,
-              mode: msg.mode,
-              stopOnPlanApproval: msg.stopOnPlanApproval,
-              appendSystemPrompt: msg.appendSystemPrompt,
-              allowedTools: msg.allowedTools,
-              disallowedTools: msg.disallowedTools,
-              auth: msg.auth,
-            })
-            .finally(() => ws.data.sessions.delete(sessionId));
+          void session.start(request.value).finally(() => ws.data.sessions.delete(sessionId));
           return;
         }
 
-        ws.data.sessions.get(sessionId)?.handleClientMessage(msg);
+        const sessionMsg = sanitizeSessionMessage(msg);
+        if (sessionMsg) {
+          ws.data.sessions.get(sessionId)?.handleClientMessage(sessionMsg);
+        }
       },
       close(ws: ServerWebSocket<SocketData>) {
         for (const session of ws.data.sessions.values()) {
@@ -147,7 +173,13 @@ export function startServer(options: StartServerOptions): WebTtyServer {
     throw new Error("[claude-web-tty] server did not bind a TCP port");
   }
 
-  console.log(`[claude-web-tty] listening on http://localhost:${port}`);
+  const url = `http://${displayHost(hostname)}:${port}`;
+  console.log(`[claude-web-tty] listening on ${url}`);
+  if (!isLoopback(hostname)) {
+    console.warn(
+      `[claude-web-tty] bound to ${hostname}: anyone who can reach this port can run claude sessions with this server's credentials`,
+    );
+  }
   if (repoMode.mode === "baked") {
     console.log(
       `[claude-web-tty] baked mode: workspace ${repoMode.repo ?? repoMode.root} @ ${repoMode.ref?.slice(0, 12)}`,
@@ -161,9 +193,33 @@ export function startServer(options: StartServerOptions): WebTtyServer {
 
   return {
     port,
-    url: `http://localhost:${port}`,
+    url,
     stop: () => server.stop(true),
   };
+}
+
+/**
+ * Vite emits content-hashed files under assets/ (plus the hashed workbox
+ * runtime at the root): those never change and can be cached forever.
+ * Everything else — index.html, sw.js, the manifest, icons — must be
+ * revalidated so deploys and service-worker updates are picked up.
+ */
+export function cacheControlFor(rel: string): string {
+  const normalized = rel.split(path.sep).join("/");
+  if (normalized.startsWith("assets/") || /^workbox-[\w-]+\.js$/.test(normalized)) {
+    return "public, max-age=31536000, immutable";
+  }
+  return "no-cache";
+}
+
+function isLoopback(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "::1" || hostname.startsWith("127.");
+}
+
+/** Host to print/open for a bind address (wildcards are reachable via localhost). */
+function displayHost(hostname: string): string {
+  if (hostname === "0.0.0.0" || hostname === "::") return "localhost";
+  return hostname.includes(":") ? `[${hostname}]` : hostname;
 }
 
 function sendTo(ws: ServerWebSocket<SocketData>, msg: ServerMessage): void {

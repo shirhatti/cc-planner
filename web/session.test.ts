@@ -801,7 +801,9 @@ describe("ClaudeSession", () => {
       } as unknown as SDKMessage;
     });
 
-    const session = new ClaudeSession((msg) => sent.push(msg), runner);
+    const session = new ClaudeSession((msg) => sent.push(msg), runner, {
+      liveStatsIntervalMs: 0,
+    });
     await session.start({ prompt: "p" });
 
     const statsEvents = sent.filter(
@@ -892,6 +894,61 @@ describe("ClaudeSession", () => {
     });
     // Haiku 4.5: (10*$1 + 10*$5) / 1M
     expect(last?.stats.costUsd).toBeCloseTo(60 / 1e6, 9);
+  });
+
+  test("live stats are throttled trailing-edge and superseded by final stats", async () => {
+    const sent: SessionEvent[] = [];
+    const statsOf = () =>
+      sent.filter(
+        (m): m is Extract<SessionEvent, { type: "session_stats" }> => m.type === "session_stats",
+      );
+    let releaseTurn!: () => void;
+    const turnDone = new Promise<void>((resolve) => (releaseTurn = resolve));
+    const runner = fakeRunner(async function* (args) {
+      // A burst of 50 fetches: the first goes out immediately, the rest
+      // coalesce into a single trailing update with the final counts.
+      for (let i = 0; i < 50; i++) {
+        args.onVfsMessage({ type: "hydrate_fetch", rel: `f${i}.ts`, size: 10 });
+      }
+      await Bun.sleep(250);
+      // Another burst: late-1 goes out immediately (the interval has
+      // elapsed); late-2 waits on the trailing timer, which the turn's
+      // final stats cancel.
+      args.onVfsMessage({ type: "hydrate_fetch", rel: "late-1.ts", size: 10 });
+      args.onVfsMessage({ type: "hydrate_fetch", rel: "late-2.ts", size: 10 });
+      await turnDone;
+      yield {
+        type: "result",
+        subtype: "success",
+        result: "ok",
+        duration_ms: 1,
+        duration_api_ms: 1,
+        num_turns: 1,
+        usage: {},
+        modelUsage: {},
+      } as unknown as SDKMessage;
+    });
+    const session = new ClaudeSession((msg) => sent.push(msg), runner, {
+      liveStatsIntervalMs: 100,
+    });
+    const done = session.start({ prompt: "p" });
+
+    await Bun.sleep(50);
+    // Every hydrate_fetch is still forwarded; stats are coalesced.
+    expect(sent.filter((m) => m.type === "hydrate_fetch").length).toBe(50);
+    expect(statsOf().map((m) => m.stats.filesHydrated)).toEqual([1]);
+
+    await Bun.sleep(250);
+    expect(statsOf().map((m) => m.stats.filesHydrated)).toEqual([1, 50, 51]);
+
+    releaseTurn();
+    await done;
+    const stats = statsOf();
+    expect(stats.at(-1)?.stats.final).toBe(true);
+    expect(stats.at(-1)?.stats.filesHydrated).toBe(52);
+    expect(stats.filter((m) => !m.stats.final)).toHaveLength(3);
+    await Bun.sleep(150);
+    expect(statsOf()).toHaveLength(stats.length);
   });
 
   test("gateway auth is passed to the runner env", async () => {

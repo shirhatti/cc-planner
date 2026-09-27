@@ -319,7 +319,15 @@ export interface ClaudeSessionOptions {
    * command policy and append the hydration guidance to the system prompt.
    */
   hydratingWorkspace?: boolean;
+  /**
+   * Minimum interval between live (non-final) session_stats events. Bursts
+   * of hydrate fetches / assistant messages are coalesced trailing-edge, so
+   * the latest numbers always go out. Default 250ms; 0 disables throttling.
+   */
+  liveStatsIntervalMs?: number;
 }
+
+const DEFAULT_LIVE_STATS_INTERVAL_MS = 250;
 
 export class ClaudeSession {
   private readonly pending = new Map<string, PendingRequest>();
@@ -339,6 +347,8 @@ export class ClaudeSession {
   private readonly liveUsageByMessage = new Map<string, { model: string; usage: TokenUsage }>();
   private filesHydrated = 0;
   private bytesFetched = 0;
+  private lastLiveStatsAt = 0;
+  private liveStatsTimer?: ReturnType<typeof setTimeout>;
 
   constructor(
     private readonly send: (msg: SessionEvent) => void,
@@ -400,8 +410,10 @@ export class ClaudeSession {
       for await (const msg of session) {
         this.handleSdkMessage(msg);
       }
+      this.flushLiveStats();
       this.send({ type: "session_done" });
     } catch (err) {
+      this.flushLiveStats();
       // An abort after plan approval (or disposing the session) is a clean stop.
       if (this.planApproved || this.abort.signal.aborted) {
         this.send({ type: "session_done" });
@@ -409,6 +421,7 @@ export class ClaudeSession {
         this.send({ type: "error", message: err instanceof Error ? err.message : String(err) });
       }
     } finally {
+      this.cancelLiveStats();
       this.input.done();
       this.failPending(new Error("Session ended"));
     }
@@ -442,6 +455,7 @@ export class ClaudeSession {
 
   /** Abort the session entirely and unblock any pending browser round-trips. */
   dispose(): void {
+    this.cancelLiveStats();
     this.failPending(new Error("Session aborted"));
     this.input.done();
     this.abort.abort();
@@ -655,11 +669,53 @@ export class ClaudeSession {
       this.filesHydrated += 1;
       this.bytesFetched += Number(msg.size) || 0;
       this.send({ type: "hydrate_fetch", rel: String(msg.rel), size: Number(msg.size) });
+      this.scheduleLiveStats();
+    }
+  }
+
+  /**
+   * Throttled sendLiveStats: sends immediately if the interval has elapsed
+   * since the last live update, otherwise schedules one trailing update
+   * (which computes stats at fire time, so it carries the latest numbers).
+   */
+  private scheduleLiveStats(): void {
+    const interval = this.options.liveStatsIntervalMs ?? DEFAULT_LIVE_STATS_INTERVAL_MS;
+    if (interval <= 0) {
+      this.sendLiveStats();
+      return;
+    }
+    if (this.liveStatsTimer !== undefined) {
+      return; // a trailing update is already pending
+    }
+    const wait = this.lastLiveStatsAt + interval - Date.now();
+    if (wait <= 0) {
+      this.sendLiveStats();
+      return;
+    }
+    this.liveStatsTimer = setTimeout(() => {
+      this.liveStatsTimer = undefined;
+      this.sendLiveStats();
+    }, wait);
+  }
+
+  /** Drop any pending trailing live-stats update. */
+  private cancelLiveStats(): void {
+    if (this.liveStatsTimer !== undefined) {
+      clearTimeout(this.liveStatsTimer);
+      this.liveStatsTimer = undefined;
+    }
+  }
+
+  /** Send a pending trailing live-stats update now, if any. */
+  private flushLiveStats(): void {
+    if (this.liveStatsTimer !== undefined) {
+      this.cancelLiveStats();
       this.sendLiveStats();
     }
   }
 
   private sendLiveStats(): void {
+    this.lastLiveStatsAt = Date.now();
     const usageByModel = new Map<string, TokenUsage>();
     const totals = emptyUsage();
     for (const { model, usage } of this.liveUsageByMessage.values()) {
@@ -720,14 +776,16 @@ export class ClaudeSession {
             model: msg.message.model ?? "unknown",
             usage: usageFromRaw(usage),
           });
-          this.sendLiveStats();
+          this.scheduleLiveStats();
         }
         break;
       }
       case "result": {
         // Per-turn stats use the SDK's authoritative (session-cumulative)
         // token counts, but cost is always estimated from public pricing —
-        // the SDK's own cost figure is never shown.
+        // the SDK's own cost figure is never shown. They supersede any
+        // pending live update.
+        this.cancelLiveStats();
         const byModel: SessionStats["byModel"] = {};
         let estimatedTotal: number | undefined;
         for (const [model, usage] of Object.entries(msg.modelUsage ?? {})) {
