@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readlinkSync, realpathSync, writeFileSync } fro
 import { tmpdir } from "os";
 import path from "path";
 import { fileURLToPath } from "url";
+import { describeCloneFailure } from "./lib/blobless-clone";
 import {
   PLANS_SUBDIR,
   planCaptureHooks,
@@ -99,4 +100,32 @@ test("plan capture - hook reports Write/Edit of files in the plans dir only", as
 test("plan capture - workspaces without .git use the default plans dir", () => {
   const ws = mkdtempSync(path.join(tmpdir(), "plan-capture-"));
   expect(plansDirectoryPath(ws, { CLAUDE_CONFIG_DIR: "/cfg" })).toBe(path.join("/cfg", "plans"));
+});
+
+test("describeCloneFailure - turns git clone stderr into an actionable message", () => {
+  const notFound =
+    "Cloning into '/var/folders/x/T/cc-planner-a'...\nremote: Repository not found.\n" +
+    "fatal: repository 'https://github.com/dotnet/aspentcore.git/' not found\n";
+  expect(describeCloneFailure("dotnet/aspentcore", undefined, notFound)).toBe(
+    'GitHub repository "dotnet/aspentcore" not found — check the owner/repo spelling, ' +
+      "or that your GitHub login (`gh auth status`) can access it",
+  );
+  expect(
+    describeCloneFailure(
+      "o/r",
+      undefined,
+      "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n",
+    ),
+  ).toMatch(/^GitHub repository "o\/r" not found/);
+  expect(
+    describeCloneFailure(
+      "o/r",
+      "nope",
+      "Cloning into 'x'...\nwarning: Could not find remote branch nope to clone.\n" +
+        "fatal: Remote branch nope not found in upstream origin\n",
+    ),
+  ).toBe('Branch "nope" not found in o/r');
+  expect(
+    describeCloneFailure("o/r", undefined, "Cloning into 'x'...\nfatal: unable to access\n"),
+  ).toBe("Cloning o/r failed: fatal: unable to access");
 });
