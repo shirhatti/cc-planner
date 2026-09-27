@@ -165,6 +165,7 @@ function install(rootInput: string): void {
     mkdirSync: fs.mkdirSync,
     chmodSync: fs.chmodSync,
     linkSync: fs.linkSync,
+    utimesSync: fs.utimesSync,
     renameSync: fs.renameSync,
     copyFileSync: fs.copyFileSync,
     copyFile: fs.copyFile,
@@ -290,6 +291,12 @@ function install(rootInput: string): void {
     try {
       orig.writeFileSync.call(fs, tmp, data);
       if (mode === "100755") orig.chmodSync.call(fs, tmp, 0o755);
+      // Keep mtime equal to the synthetic stat's (the commit time). Claude
+      // Code records a file's mtime when it Reads it and refuses to Edit if
+      // the mtime has since grown ("File has been modified since read");
+      // Read stats before reading, so a download stamped "now" would trip it.
+      const t = getRefTimeMs() / 1000;
+      orig.utimesSync.call(fs, tmp, t, t);
       try {
         orig.linkSync.call(fs, tmp, abs);
       } catch (err) {
@@ -426,19 +433,51 @@ function install(rootInput: string): void {
     return refTimeMs;
   }
 
+  // Blob sizes, when they can be learned without downloading blobs: the
+  // gh strategy asks the GitHub trees API once for the whole tree. A size
+  // that isn't known (git strategy, truncated tree, API failure) makes stat
+  // fall back to hydrating — never report a wrong size: Claude Code rejects
+  // a 0-byte PDF as empty without reading it.
+  let blobSizes: Map<string, number> | undefined;
+  function knownSize(rel: string): number | undefined {
+    if (!blobSizes) {
+      blobSizes = new Map();
+      if (STRATEGY === "gh") {
+        const res = spawnSync("gh", ["api", `repos/${REPO}/git/trees/${REF}?recursive=1`], {
+          encoding: "utf-8",
+          maxBuffer: 256 * 1024 * 1024,
+        });
+        if (!res.error && res.status === 0) {
+          try {
+            const body = JSON.parse(res.stdout) as {
+              tree?: { path?: string; type?: string; size?: number }[];
+            };
+            for (const e of body.tree ?? []) {
+              if (e.type === "blob" && typeof e.path === "string" && typeof e.size === "number") {
+                blobSizes.set(e.path, e.size);
+              }
+            }
+          } catch {
+            // Unparseable response — every stat falls back to hydrating.
+          }
+        }
+      }
+    }
+    return blobSizes.get(rel);
+  }
+
   let rootDev: number | undefined;
   const syntheticInodes = new Map<string, number>();
 
   /**
    * A Stats object for an unhydrated manifest file.
    *
-   * size is reported as 0: the real size lives only in the blob (or behind a
-   * GitHub API call), and `git cat-file -s` would itself download the blob in
-   * a blob-less clone, defeating the point. Hydrating reads report the real
-   * size afterwards, since the file is then on disk. Symlinks (mode 120000)
-   * are reported as regular files, matching how they are hydrated.
+   * `size` must be the real blob size (see knownSize). mtime is the commit
+   * time, which publish() also stamps on the hydrated file so stat answers
+   * don't change across hydration. Symlinks (mode 120000) are reported as
+   * regular files, matching how they are hydrated.
    */
-  function syntheticFileStats(rel: string): unknown {
+  function syntheticFileStats(rel: string, size: number): unknown {
     rootDev ??= orig.statSync.call(fs, ROOT).dev as number;
     let ino = syntheticInodes.get(rel);
     if (ino === undefined) {
@@ -456,9 +495,9 @@ function install(rootInput: string): void {
       uid: process.getuid?.() ?? 0,
       gid: process.getgid?.() ?? 0,
       rdev: 0,
-      size: 0,
+      size,
       blksize: 4096,
-      blocks: 0,
+      blocks: Math.ceil(size / 512),
       atimeMs: t,
       mtimeMs: t,
       ctimeMs: t,
@@ -501,7 +540,10 @@ function install(rootInput: string): void {
     // BigInt stats are rare; those fall through to hydrate + real stat.
     if (options && typeof options === "object" && options.bigint) return null;
     const rel = unhydratedFile(args[0]);
-    return rel === null ? null : { value: syntheticFileStats(rel) };
+    if (rel === null) return null;
+    const size = knownSize(rel);
+    // Unknown size: fall through to hydrate + real stat.
+    return size === undefined ? null : { value: syntheticFileStats(rel, size) };
   };
 
   const accessShortcut: Shortcut = (args) => {

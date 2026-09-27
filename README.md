@@ -94,7 +94,7 @@ CC_HYDRATE_ROOT=/tmp/ws \
 Two things to know:
 
 - `--preload` only applies to a JS entrypoint, so this runs the `cli.js` vendored in `@anthropic-ai/claude-agent-sdk` (it _is_ Claude Code) rather than a native-installer `claude` binary.
-- The plain CLI doesn't get the web app's extras (plan streaming UI, Bash hydration policy, prompt-free read-only tools) — it's just Claude Code on a lazily-hydrated workspace. Directory listings and `stat`/`access`/`realpath` come from the repo manifest (unhydrated files report size 0 and the commit time as mtime, so a broad Glob downloads nothing); file contents are fetched on first read. See [Configuration](#configuration) for the `CC_HYDRATE_*` knobs.
+- The plain CLI doesn't get the web app's extras (plan streaming UI, Bash hydration policy, prompt-free read-only tools) — it's just Claude Code on a lazily-hydrated workspace. Directory listings, `access` and `realpath` come from the repo manifest. With the `gh` strategy `stat` does too — sizes come from one GitHub trees API call and mtime is the commit time (hydrated files keep it), so a broad Glob downloads nothing; with the `git` strategy sizes can't be known without the blob, so `stat` hydrates. File contents are fetched on first read. See [Configuration](#configuration) for the `CC_HYDRATE_*` knobs.
 
 ## Web TTY
 

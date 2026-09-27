@@ -27,7 +27,8 @@ const PLANS_DIR = path.join(process.env.HOME!, ".claude", "plans");
 // ---------------------------------------------------------------------------
 
 // Serves `gh api repos/<owner>/<repo>/contents/<path>?ref=<sha>` from the
-// upstream working tree and logs every invocation, so tests can run offline
+// upstream working tree (and `.../git/trees/<sha>?recursive=1` from a
+// precomputed JSON file) and logs every invocation, so tests can run offline
 // and assert exactly when fetches happen.
 const FAKE_GH = `#!/usr/bin/env bash
 set -euo pipefail
@@ -37,6 +38,9 @@ if [ "$1" != "api" ]; then
   exit 1
 fi
 endpoint="$2"
+if [[ "$endpoint" == repos/*/git/trees/* ]]; then
+  exec cat "$FAKE_GH_TREE_JSON"
+fi
 p="\${endpoint#repos/*/contents/}"
 p="\${p%%\\?*}"
 exec cat "$FAKE_GH_CONTENT_DIR/$p"
@@ -46,6 +50,7 @@ let workDir: string;
 let upstream: string;
 let shimDir: string;
 let headSha: string;
+let treeJson: string;
 let cloneCounter = 0;
 
 function git(cwd: string, ...args: string[]): string {
@@ -81,6 +86,18 @@ beforeAll(() => {
   git(upstream, "commit", "-m", "initial");
   headSha = git(upstream, "rev-parse", "HEAD").trim();
 
+  // GitHub trees API response (recursive) for HEAD, with blob sizes.
+  const tree = git(upstream, "ls-tree", "-r", "-l", "-z", "HEAD")
+    .split("\0")
+    .filter(Boolean)
+    .map((line) => {
+      const [meta, p] = line.split("\t");
+      const [mode, type, sha, size] = meta.split(/\s+/);
+      return { path: p, mode, type, sha, size: Number(size) };
+    });
+  treeJson = path.join(workDir, "tree.json");
+  writeFileSync(treeJson, JSON.stringify({ sha: headSha, tree, truncated: false }));
+
   shimDir = path.join(workDir, "fake-bin");
   mkdirSync(shimDir);
   writeFileSync(path.join(shimDir, "gh"), FAKE_GH);
@@ -114,6 +131,7 @@ function freshClone(): Fixture {
       PATH: `${shimDir}:${process.env.PATH}`,
       FAKE_GH_LOG: logFile,
       FAKE_GH_CONTENT_DIR: upstream,
+      FAKE_GH_TREE_JSON: treeJson,
       CC_HYDRATE_ROOT: root,
       CC_HYDRATE_REPO: "acme/widgets",
       CC_HYDRATE_REF: headSha,
@@ -123,6 +141,11 @@ function freshClone(): Fixture {
 
 function ghCalls(fixture: Fixture): string[] {
   return readFileSync(fixture.logFile, "utf-8").split("\n").filter(Boolean);
+}
+
+/** gh calls that download file contents (excludes the one-off tree listing). */
+function contentFetches(fixture: Fixture): string[] {
+  return ghCalls(fixture).filter((c) => c.includes("/contents/"));
 }
 
 interface TestResult {
@@ -258,6 +281,7 @@ test("hydrating VFS - statSync/lstatSync/accessSync answer from the manifest wit
     const script = ${JSON.stringify(script)};
     const s = fs.statSync(readme);
     console.log("isFile:" + s.isFile() + ":" + s.isDirectory());
+    console.log("size:" + s.size);
     console.log("instance:" + (s instanceof fs.Stats));
     console.log("mtime:" + s.mtimeMs + ":" + s.mtime.getTime());
     console.log("lstat:" + fs.lstatSync(readme).isFile());
@@ -274,6 +298,7 @@ test("hydrating VFS - statSync/lstatSync/accessSync answer from the manifest wit
 
   expect(exitCode).toBe(0);
   expect(stdout).toContain("isFile:true:false");
+  expect(stdout).toContain(`size:${statSync(path.join(upstream, "README.md")).size}`);
   expect(stdout).toContain("instance:true");
   expect(stdout).toContain(`mtime:${commitTime}:${commitTime}`);
   expect(stdout).toContain("lstat:true");
@@ -281,8 +306,10 @@ test("hydrating VFS - statSync/lstatSync/accessSync answer from the manifest wit
   expect(stdout).toContain("access:ok");
   expect(stdout).toContain("xok:EACCES");
   expect(stdout).toContain("missing:undefined");
-  // Nothing was downloaded or written to disk
-  expect(ghCalls(fixture).length).toBe(0);
+  // Nothing was downloaded or written to disk — sizes came from one tree listing
+  expect(contentFetches(fixture).length).toBe(0);
+  expect(ghCalls(fixture).length).toBe(1);
+  expect(ghCalls(fixture)[0]).toContain(`repos/acme/widgets/git/trees/${headSha}?recursive=1`);
   expect(events.filter((e) => e.type === "hydrate_fetch").length).toBe(0);
   expect(existsSync(readme)).toBe(false);
   expect(existsSync(script)).toBe(false);
@@ -320,11 +347,11 @@ test("hydrating VFS - async stat/lstat/access and realpath do not fetch", async 
   expect(stdout).toContain("cbaccess:ok");
   expect(stdout).toContain("realpath:true");
   expect(stdout).toContain("prealpath:true");
-  expect(ghCalls(fixture).length).toBe(0);
+  expect(contentFetches(fixture).length).toBe(0);
   expect(existsSync(target)).toBe(false);
 });
 
-test("hydrating VFS - reading after stat hydrates and stat then reports the real size", async () => {
+test("hydrating VFS - stat reports the same size and mtime before and after hydrating", async () => {
   const fixture = freshClone();
   const target = path.join(fixture.root, "README.md");
 
@@ -332,18 +359,49 @@ test("hydrating VFS - reading after stat hydrates and stat then reports the real
     `
     const fs = require('fs');
     const p = ${JSON.stringify(target)};
-    console.log("before:" + fs.statSync(p).size);
+    const a = fs.statSync(p);
+    console.log("before:" + a.size + ":" + a.mtimeMs);
     console.log("read:" + fs.readFileSync(p, "utf-8").trim());
-    console.log("after:" + fs.statSync(p).size);
+    const b = fs.statSync(p);
+    console.log("after:" + b.size + ":" + b.mtimeMs);
+  `,
+    fixture,
+  );
+
+  // Claude Code's Edit refuses when mtime grew since Read ("modified since
+  // read"), and Read stats before it reads — so hydration must not bump mtime.
+  const size = statSync(path.join(upstream, "README.md")).size;
+  const commitTime = Number(git(upstream, "show", "-s", "--format=%ct", headSha).trim()) * 1000;
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain(`before:${size}:${commitTime}`);
+  expect(stdout).toContain("read:# Widgets");
+  expect(stdout).toContain(`after:${size}:${commitTime}`);
+  expect(contentFetches(fixture).length).toBe(1);
+});
+
+test("hydrating VFS - stat hydrates when the size is unknown", async () => {
+  const fixture = freshClone();
+  // Tree listing fails (e.g. API unavailable): sizes are unknown.
+  fixture.env.FAKE_GH_TREE_JSON = path.join(workDir, "no-such-tree.json");
+  const target = path.join(fixture.root, "README.md");
+
+  const { exitCode, stdout } = await runHydrated(
+    `
+    const fs = require('fs');
+    const p = ${JSON.stringify(target)};
+    console.log("size:" + fs.statSync(p).size);
+    fs.accessSync(p);
+    console.log("access:ok");
   `,
     fixture,
   );
 
   expect(exitCode).toBe(0);
-  expect(stdout).toContain("before:0");
-  expect(stdout).toContain("read:# Widgets");
-  expect(stdout).toContain(`after:${statSync(path.join(upstream, "README.md")).size}`);
-  expect(ghCalls(fixture).length).toBe(1);
+  expect(stdout).toContain(`size:${statSync(path.join(upstream, "README.md")).size}`);
+  expect(stdout).toContain("access:ok");
+  // stat hydrated rather than report a wrong size
+  expect(contentFetches(fixture).length).toBe(1);
+  expect(existsSync(target)).toBe(true);
 });
 
 test("hydrating VFS - concurrent async reads of one file fetch once", async () => {
@@ -620,6 +678,8 @@ test("hydrating VFS - git strategy fetches blobs from the promisor remote withou
     console.log("read:" + fs.readFileSync(${JSON.stringify(target)}, "utf-8").trim());
     const helper = require('path').join(${JSON.stringify(fixture.root)}, "src", "util", "helper.ts");
     fs.promises.readFile(helper, "utf-8").then((d) => console.log("async:" + d.trim()));
+    const readme = require('path').join(${JSON.stringify(fixture.root)}, "README.md");
+    console.log("statsize:" + fs.statSync(readme).size);
   `,
     fixture,
   );
@@ -627,6 +687,8 @@ test("hydrating VFS - git strategy fetches blobs from the promisor remote withou
   expect(exitCode).toBe(0);
   expect(stdout).toContain("read:export const answer = 42;");
   expect(stdout).toContain("async:export function help() {}");
+  // No blob sizes without downloading under the git strategy: stat hydrates.
+  expect(stdout).toContain(`statsize:${statSync(path.join(upstream, "README.md")).size}`);
   // gh was never invoked — content came through git's lazy promisor fetch
   expect(ghCalls(fixture).length).toBe(0);
   expect(readFileSync(target, "utf-8")).toBe("export const answer = 42;\n");
