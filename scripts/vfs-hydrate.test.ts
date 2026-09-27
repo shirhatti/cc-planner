@@ -245,23 +245,175 @@ test("hydrating VFS - existsSync answers from the manifest without fetching", as
   expect(existsSync(path.join(fixture.root, "src"))).toBe(false);
 });
 
-test("hydrating VFS - statSync hydrates and reports the real size", async () => {
+test("hydrating VFS - statSync/lstatSync/accessSync answer from the manifest without fetching", async () => {
+  const fixture = freshClone();
+  const readme = path.join(fixture.root, "README.md");
+  const script = path.join(fixture.root, "tools", "run.sh");
+  const commitTime = Number(git(upstream, "show", "-s", "--format=%ct", headSha).trim()) * 1000;
+
+  const { exitCode, stdout, events } = await runHydrated(
+    `
+    const fs = require('fs');
+    const readme = ${JSON.stringify(readme)};
+    const script = ${JSON.stringify(script)};
+    const s = fs.statSync(readme);
+    console.log("isFile:" + s.isFile() + ":" + s.isDirectory());
+    console.log("instance:" + (s instanceof fs.Stats));
+    console.log("mtime:" + s.mtimeMs + ":" + s.mtime.getTime());
+    console.log("lstat:" + fs.lstatSync(readme).isFile());
+    console.log("exec:" + ((fs.statSync(script).mode & 0o100) !== 0) + ":" + ((s.mode & 0o100) !== 0));
+    fs.accessSync(readme, fs.constants.R_OK);
+    console.log("access:ok");
+    try { fs.accessSync(readme, fs.constants.X_OK); console.log("xok:yes"); }
+    catch (e) { console.log("xok:" + e.code); }
+    console.log("missing:" + fs.statSync(readme + ".nope", { throwIfNoEntry: false }));
+    console.log("onDisk:" + require('fs').readdirSync(${JSON.stringify(fixture.root)}).length);
+  `,
+    fixture,
+  );
+
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain("isFile:true:false");
+  expect(stdout).toContain("instance:true");
+  expect(stdout).toContain(`mtime:${commitTime}:${commitTime}`);
+  expect(stdout).toContain("lstat:true");
+  expect(stdout).toContain("exec:true:false");
+  expect(stdout).toContain("access:ok");
+  expect(stdout).toContain("xok:EACCES");
+  expect(stdout).toContain("missing:undefined");
+  // Nothing was downloaded or written to disk
+  expect(ghCalls(fixture).length).toBe(0);
+  expect(events.filter((e) => e.type === "hydrate_fetch").length).toBe(0);
+  expect(existsSync(readme)).toBe(false);
+  expect(existsSync(script)).toBe(false);
+});
+
+test("hydrating VFS - async stat/lstat/access and realpath do not fetch", async () => {
+  const fixture = freshClone();
+  const target = path.join(fixture.root, "src", "util", "helper.ts");
+
+  const { exitCode, stdout } = await runHydrated(
+    `
+    const fs = require('fs');
+    const p = ${JSON.stringify(target)};
+    (async () => {
+      console.log("pstat:" + (await fs.promises.stat(p)).isFile());
+      console.log("plstat:" + (await fs.promises.lstat(p)).isFile());
+      await fs.promises.access(p);
+      console.log("paccess:ok");
+      const cb = await new Promise((res) => fs.stat(p, (err, s) => res(err ? err.code : s.isFile())));
+      console.log("cbstat:" + cb);
+      const acc = await new Promise((res) => fs.access(p, (err) => res(err ? err.code : "ok")));
+      console.log("cbaccess:" + acc);
+      console.log("realpath:" + (fs.realpathSync(p) === fs.realpathSync.native(p)));
+      console.log("prealpath:" + (await fs.promises.realpath(p)).endsWith("/src/util/helper.ts"));
+    })();
+  `,
+    fixture,
+  );
+
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain("pstat:true");
+  expect(stdout).toContain("plstat:true");
+  expect(stdout).toContain("paccess:ok");
+  expect(stdout).toContain("cbstat:true");
+  expect(stdout).toContain("cbaccess:ok");
+  expect(stdout).toContain("realpath:true");
+  expect(stdout).toContain("prealpath:true");
+  expect(ghCalls(fixture).length).toBe(0);
+  expect(existsSync(target)).toBe(false);
+});
+
+test("hydrating VFS - reading after stat hydrates and stat then reports the real size", async () => {
   const fixture = freshClone();
   const target = path.join(fixture.root, "README.md");
 
   const { exitCode, stdout } = await runHydrated(
     `
     const fs = require('fs');
-    const stats = fs.statSync(${JSON.stringify(target)});
-    console.log("size:" + stats.size);
-    console.log("isFile:" + stats.isFile());
+    const p = ${JSON.stringify(target)};
+    console.log("before:" + fs.statSync(p).size);
+    console.log("read:" + fs.readFileSync(p, "utf-8").trim());
+    console.log("after:" + fs.statSync(p).size);
   `,
     fixture,
   );
 
   expect(exitCode).toBe(0);
-  expect(stdout).toContain(`size:${statSync(path.join(upstream, "README.md")).size}`);
-  expect(stdout).toContain("isFile:true");
+  expect(stdout).toContain("before:0");
+  expect(stdout).toContain("read:# Widgets");
+  expect(stdout).toContain(`after:${statSync(path.join(upstream, "README.md")).size}`);
+  expect(ghCalls(fixture).length).toBe(1);
+});
+
+test("hydrating VFS - concurrent async reads of one file fetch once", async () => {
+  const fixture = freshClone();
+  const target = path.join(fixture.root, "src", "index.ts");
+
+  const { exitCode, stdout, events } = await runHydrated(
+    `
+    const fs = require('fs');
+    const p = ${JSON.stringify(target)};
+    const cb = new Promise((res) => fs.readFile(p, "utf-8", (err, d) => res(err ? err.code : d)));
+    Promise.all([
+      fs.promises.readFile(p, "utf-8"),
+      fs.promises.readFile(p, "utf-8"),
+      cb,
+    ]).then((all) => {
+      console.log("same:" + all.every((d) => d === "export const answer = 42;\\n"));
+      console.log("tmp:" + fs.readdirSync(require('path').dirname(p)).filter((n) => n.includes("vfs-hydrate")).length);
+    });
+  `,
+    fixture,
+  );
+
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain("same:true");
+  expect(stdout).toContain("tmp:0");
+  expect(ghCalls(fixture).length).toBe(1);
+  expect(events.filter((e) => e.type === "hydrate_fetch").length).toBe(1);
+  expect(readFileSync(target, "utf-8")).toBe("export const answer = 42;\n");
+});
+
+test("hydrating VFS - recursive readdir lists just the subtree", async () => {
+  const fixture = freshClone();
+
+  const { exitCode, stdout } = await runHydrated(
+    `
+    const fs = require('fs');
+    const path = require('path');
+    const src = path.join(${JSON.stringify(fixture.root)}, "src");
+    console.log("src:" + fs.readdirSync(src, { recursive: true }).sort().join(","));
+  `,
+    fixture,
+  );
+
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain("src:index.ts,util,util/helper.ts");
+  expect(ghCalls(fixture).length).toBe(0);
+});
+
+test("hydrating VFS - unlinking a hydrated file makes it disappear", async () => {
+  const fixture = freshClone();
+  const target = path.join(fixture.root, "src", "index.ts");
+
+  const { exitCode, stdout } = await runHydrated(
+    `
+    const fs = require('fs');
+    const p = ${JSON.stringify(target)};
+    fs.readFileSync(p);
+    fs.unlinkSync(p);
+    console.log("exists:" + fs.existsSync(p));
+    try { fs.readFileSync(p); console.log("read:yes"); } catch (e) { console.log("read:" + e.code); }
+    try { fs.statSync(p); console.log("stat:yes"); } catch (e) { console.log("stat:" + e.code); }
+  `,
+    fixture,
+  );
+
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain("exists:false");
+  expect(stdout).toContain("read:ENOENT");
+  expect(stdout).toContain("stat:ENOENT");
   expect(ghCalls(fixture).length).toBe(1);
 });
 
@@ -466,12 +618,15 @@ test("hydrating VFS - git strategy fetches blobs from the promisor remote withou
     `
     const fs = require('fs');
     console.log("read:" + fs.readFileSync(${JSON.stringify(target)}, "utf-8").trim());
+    const helper = require('path').join(${JSON.stringify(fixture.root)}, "src", "util", "helper.ts");
+    fs.promises.readFile(helper, "utf-8").then((d) => console.log("async:" + d.trim()));
   `,
     fixture,
   );
 
   expect(exitCode).toBe(0);
   expect(stdout).toContain("read:export const answer = 42;");
+  expect(stdout).toContain("async:export function help() {}");
   // gh was never invoked — content came through git's lazy promisor fetch
   expect(ghCalls(fixture).length).toBe(0);
   expect(readFileSync(target, "utf-8")).toBe("export const answer = 42;\n");

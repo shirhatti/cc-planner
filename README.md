@@ -94,7 +94,7 @@ CC_HYDRATE_ROOT=/tmp/ws \
 Two things to know:
 
 - `--preload` only applies to a JS entrypoint, so this runs the `cli.js` vendored in `@anthropic-ai/claude-agent-sdk` (it _is_ Claude Code) rather than a native-installer `claude` binary.
-- The plain CLI doesn't get the web app's extras (plan streaming UI, Bash hydration policy, prompt-free read-only tools) — it's just Claude Code on a lazily-hydrated workspace. Directory listings come from the repo manifest; file contents are fetched on first Read. See [Configuration](#configuration) for the `CC_HYDRATE_*` knobs.
+- The plain CLI doesn't get the web app's extras (plan streaming UI, Bash hydration policy, prompt-free read-only tools) — it's just Claude Code on a lazily-hydrated workspace. Directory listings and `stat`/`access`/`realpath` come from the repo manifest (unhydrated files report size 0 and the commit time as mtime, so a broad Glob downloads nothing); file contents are fetched on first read. See [Configuration](#configuration) for the `CC_HYDRATE_*` knobs.
 
 ## Web TTY
 
@@ -107,6 +107,8 @@ bun run start          # serve http://localhost:3000 (PORT to override)
 # development: Bun server + Vite dev server (HMR, proxies /ws to :3000)
 bun run start & bun run dev:ui
 ```
+
+The server binds `127.0.0.1` by default — it runs claude sessions with the host's credentials and filesystem, so exposing it on the network is an explicit opt-in via `CC_WEB_HOST=0.0.0.0` (the Dockerfile sets this; put an authenticating proxy in front of anything reachable by others). WebSocket upgrades from a browser page on a different origin are rejected (403); add trusted origins with `CC_WEB_ALLOWED_ORIGINS`. Start messages are validated server-side: the permission mode must be `plan`, `default`, or `acceptEdits` (never `bypassPermissions`), and malformed tool lists or options are dropped.
 
 **Features**
 
@@ -190,17 +192,19 @@ Every session-scoped WebSocket message carries a client-generated `sessionId` (`
 
 All `CC_`-prefixed env vars in one place:
 
-| Variable              | Read by                        | Default                          | Description                                                                                                                                                                                             |
-| --------------------- | ------------------------------ | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CC_BAKED_REPO_PATH`  | `web/lib/server.ts`            | unset                            | Path to a fully checked-out repo. If the directory exists, the web app runs in **baked** mode and plans against it; otherwise it runs in **lazy hydration** mode. The Dockerfile sets this to `/repo`.  |
-| `CC_BAKED_REPO`       | `web/lib/server.ts`            | unset                            | `owner/repo` label for the baked checkout, shown in the UI and session records. Set from the `BAKE_REPO` build arg by the Dockerfile.                                                                   |
-| `CC_HYDRATE_ROOT`     | `preload/vfs-hydrate.ts`       | unset (preload is inert)         | Path of the blob-less working tree to hydrate into.                                                                                                                                                     |
-| `CC_HYDRATE_REPO`     | `preload/vfs-hydrate.ts`       | parsed from the `origin` remote  | `owner/repo` used for `gh api` content fetches.                                                                                                                                                         |
-| `CC_HYDRATE_REF`      | `preload/vfs-hydrate.ts`       | `HEAD`'s sha                     | Commit to hydrate file contents from.                                                                                                                                                                   |
-| `CC_HYDRATE_STRATEGY` | `preload/vfs-hydrate.ts`       | `gh`                             | How contents are fetched: `gh` (GitHub contents API) or `git` (promisor lazy fetch). See [Hydration Strategies](#hydration-strategies).                                                                 |
-| `CC_RESOURCES_ROOT`   | `scripts/lib/runtime-paths.ts` | unset (resolve from source tree) | Directory containing copies of `preload/` and the agent SDK (`claude-agent-sdk/cli.js`). Set by the packaged desktop app (`desktop/index.ts`), where import.meta-relative paths don't survive bundling. |
+| Variable                 | Read by                        | Default                          | Description                                                                                                                                                                                             |
+| ------------------------ | ------------------------------ | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CC_BAKED_REPO_PATH`     | `web/lib/server.ts`            | unset                            | Path to a fully checked-out repo. If the directory exists, the web app runs in **baked** mode and plans against it; otherwise it runs in **lazy hydration** mode. The Dockerfile sets this to `/repo`.  |
+| `CC_BAKED_REPO`          | `web/lib/server.ts`            | unset                            | `owner/repo` label for the baked checkout, shown in the UI and session records. Set from the `BAKE_REPO` build arg by the Dockerfile.                                                                   |
+| `CC_HYDRATE_ROOT`        | `preload/vfs-hydrate.ts`       | unset (preload is inert)         | Path of the blob-less working tree to hydrate into.                                                                                                                                                     |
+| `CC_HYDRATE_REPO`        | `preload/vfs-hydrate.ts`       | parsed from the `origin` remote  | `owner/repo` used for `gh api` content fetches.                                                                                                                                                         |
+| `CC_HYDRATE_REF`         | `preload/vfs-hydrate.ts`       | `HEAD`'s sha                     | Commit to hydrate file contents from.                                                                                                                                                                   |
+| `CC_HYDRATE_STRATEGY`    | `preload/vfs-hydrate.ts`       | `gh`                             | How contents are fetched: `gh` (GitHub contents API) or `git` (promisor lazy fetch). See [Hydration Strategies](#hydration-strategies).                                                                 |
+| `CC_RESOURCES_ROOT`      | `scripts/lib/runtime-paths.ts` | unset (resolve from source tree) | Directory containing copies of `preload/` and the agent SDK (`claude-agent-sdk/cli.js`). Set by the packaged desktop app (`desktop/index.ts`), where import.meta-relative paths don't survive bundling. |
+| `CC_WEB_HOST`            | `web/server.ts`                | `127.0.0.1`                      | Interface the web server binds. Set to `0.0.0.0` to accept non-local connections; the Dockerfile does this so `-p 3000:3000` works.                                                                     |
+| `CC_WEB_ALLOWED_ORIGINS` | `web/server.ts`                | unset (same-origin only)         | Comma-separated extra browser origins (`https://host:port`) allowed to open the `/ws` WebSocket. Requests without an `Origin` header (non-browser clients) are always allowed.                          |
 
-The `CC_HYDRATE_*` vars are set automatically by `planRemoteRepo()` for the child claude process — you only set them yourself when wiring up `preload/vfs-hydrate.ts` manually (see [Configuration](#configuration)). The `CC_BAKED_*` vars configure the web server's repo mode and are normally set by the Dockerfile.
+The `CC_HYDRATE_*` vars are set automatically by `planRemoteRepo()` for the child claude process — you only set them yourself when wiring up `preload/vfs-hydrate.ts` manually (see [Configuration](#configuration)). The `CC_BAKED_*` vars configure the web server's repo mode and are normally set by the Dockerfile; `CC_WEB_*` configure its network exposure.
 
 ## Usage Example
 

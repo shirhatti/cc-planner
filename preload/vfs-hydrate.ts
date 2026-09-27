@@ -9,7 +9,10 @@
  * which is always available locally in a blob-less clone. File contents are
  * fetched on demand via the `gh` CLI (GitHub Contents API) the first time a
  * file is read, then written to disk so subsequent access — including from
- * subprocesses like ripgrep — hits the hydrated copy.
+ * subprocesses like ripgrep — hits the hydrated copy. Metadata calls
+ * (stat/lstat/access/realpath) never hydrate: unhydrated files get
+ * synthetic answers from the manifest. Async fs APIs fetch in a child
+ * process without blocking the event loop.
  *
  * Configuration (env vars):
  * - CC_HYDRATE_ROOT     (required) absolute path of the blob-less working
@@ -24,7 +27,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 
 // ---------------------------------------------------------------------------
 // Pure helpers (exported for unit tests)
@@ -156,10 +159,13 @@ function install(rootInput: string): void {
     realpathSync: fs.realpathSync,
     realpathSyncNative: fs.realpathSync.native,
     realpath: fs.realpath,
+    realpathNative: fs.realpath.native,
     unlinkSync: fs.unlinkSync,
     unlink: fs.unlink,
     mkdirSync: fs.mkdirSync,
     chmodSync: fs.chmodSync,
+    linkSync: fs.linkSync,
+    renameSync: fs.renameSync,
     copyFileSync: fs.copyFileSync,
     copyFile: fs.copyFile,
   };
@@ -186,6 +192,49 @@ function install(rootInput: string): void {
   }
 
   // -------------------------------------------------------------------------
+  // Path mapping and the on-disk cache
+  // -------------------------------------------------------------------------
+
+  /**
+   * Map a path to its repo-relative form, or null when this preload should
+   * not get involved (outside the root, inside .git, or not a string path).
+   */
+  function relUnderRoot(p: unknown): string | null {
+    if (typeof p !== "string" || p.length === 0) return null;
+    const resolved = path.resolve(p);
+    if (resolved !== ROOT && !resolved.startsWith(ROOT + path.sep)) return null;
+    const rel = path.relative(ROOT, resolved);
+    if (rel === ".git" || rel.startsWith(".git" + path.sep)) return null;
+    return rel;
+  }
+
+  // Manifest paths known to exist on disk (hydrated, mkdir'd, or observed),
+  // so repeat access skips the existsSync syscall. Entries are dropped when
+  // this process unlinks the path. Removals made behind our back (a
+  // subprocess `rm`, a rename away) leave a stale entry, which then surfaces
+  // as a plain ENOENT from the real fs rather than a silent re-download.
+  const onDisk = new Set<string>();
+
+  function isManifestPath(rel: string): boolean {
+    return hasManifestFile(rel) || dirs.has(rel);
+  }
+
+  /** Whether a manifest path is already on disk (cached, else one syscall). */
+  function isOnDisk(rel: string): boolean {
+    if (onDisk.has(rel)) return true;
+    if (orig.existsSync.call(fs, path.join(ROOT, rel))) {
+      onDisk.add(rel);
+      return true;
+    }
+    return false;
+  }
+
+  function forgetOnDisk(p: unknown): void {
+    const rel = relUnderRoot(p);
+    if (rel !== null) onDisk.delete(rel);
+  }
+
+  // -------------------------------------------------------------------------
   // Hydration
   // -------------------------------------------------------------------------
 
@@ -207,59 +256,135 @@ function install(rootInput: string): void {
     ];
   }
 
-  function hydrate(rel: string, abs: string): void {
+  function spawnFailure(cmd: string, rel: string, abs: string, err: unknown): Error {
+    sendIpc({ type: "hydrate_error", path: abs, rel, error: String(err) });
+    return new Error(`vfs-hydrate: failed to run ${cmd} for '${rel}': ${err}`);
+  }
+
+  function fetchFailure(cmd: string, rel: string, abs: string, stderr: string): Error {
+    sendIpc({ type: "hydrate_error", path: abs, rel, error: stderr });
+    return Object.assign(new Error(`vfs-hydrate: ${cmd} fetch failed for '${rel}': ${stderr}`), {
+      code: "EIO",
+      path: abs,
+    });
+  }
+
+  let tmpCounter = 0;
+  const TMP_NAME = /^\..+\.vfs-hydrate-\d+-\d+$/;
+
+  /**
+   * Write fetched content to `abs` atomically: write a temp file in the same
+   * directory, then hard-link it into place. link() fails with EEXIST instead
+   * of clobbering, so a concurrent hydration of the same file or a write by
+   * the program that landed while the fetch was in flight always wins, and
+   * readers never observe partial content. Falls back to rename() on
+   * filesystems without hard links. Uses sync fs calls on purpose: they are
+   * local and fast, and keep the tombstone check and the publish in one tick.
+   */
+  function publish(rel: string, abs: string, data: Buffer, mode: string): void {
+    if (deleted.has(rel)) return; // unlinked while the fetch was in flight
+    const dir = path.dirname(abs);
+    orig.mkdirSync.call(fs, dir, { recursive: true });
+    tmpCounter += 1;
+    const tmp = path.join(dir, `.${path.basename(abs)}.vfs-hydrate-${process.pid}-${tmpCounter}`);
+    try {
+      orig.writeFileSync.call(fs, tmp, data);
+      if (mode === "100755") orig.chmodSync.call(fs, tmp, 0o755);
+      try {
+        orig.linkSync.call(fs, tmp, abs);
+      } catch (err) {
+        if ((err as { code?: string }).code !== "EEXIST") {
+          orig.renameSync.call(fs, tmp, abs);
+        }
+      }
+    } finally {
+      try {
+        orig.unlinkSync.call(fs, tmp);
+      } catch {
+        // already renamed into place
+      }
+    }
+    onDisk.add(rel);
+  }
+
+  function hydrateSync(rel: string, abs: string): void {
     const entry = files.get(rel);
     if (!entry) return;
 
+    // A sync read can't wait on an in-flight async fetch of the same file;
+    // it just fetches again. publish() makes the duplicate harmless.
     const [cmd, args] = fetchCommand(rel);
     const res = spawnSync(cmd, args, { maxBuffer: 256 * 1024 * 1024 });
 
-    if (res.error) {
-      sendIpc({ type: "hydrate_error", path: abs, rel, error: String(res.error) });
-      throw new Error(`vfs-hydrate: failed to run ${cmd} for '${rel}': ${res.error}`);
-    }
+    if (res.error) throw spawnFailure(cmd, rel, abs, res.error);
     if (res.status !== 0) {
-      const stderr = (res.stderr?.toString("utf-8") ?? "").trim();
-      sendIpc({ type: "hydrate_error", path: abs, rel, error: stderr });
-      throw Object.assign(new Error(`vfs-hydrate: ${cmd} fetch failed for '${rel}': ${stderr}`), {
-        code: "EIO",
-        path: abs,
-      });
+      throw fetchFailure(cmd, rel, abs, (res.stderr?.toString("utf-8") ?? "").trim());
     }
 
-    orig.mkdirSync.call(fs, path.dirname(abs), { recursive: true });
-    orig.writeFileSync.call(fs, abs, res.stdout);
-    if (entry.mode === "100755") {
-      orig.chmodSync.call(fs, abs, 0o755);
-    }
-
+    publish(rel, abs, res.stdout, entry.mode);
     sendIpc({ type: "hydrate_fetch", path: abs, rel, size: res.stdout.length });
   }
 
-  /**
-   * Map a path to its repo-relative form, or null when this preload should
-   * not get involved (outside the root, inside .git, or not a string path).
-   */
-  function relUnderRoot(p: unknown): string | null {
-    if (typeof p !== "string" || p.length === 0) return null;
-    const resolved = path.resolve(p);
-    if (resolved !== ROOT && !resolved.startsWith(ROOT + path.sep)) return null;
-    const rel = path.relative(ROOT, resolved);
-    if (rel === ".git" || rel.startsWith(".git" + path.sep)) return null;
-    return rel;
+  // Async fetches in flight, so concurrent async reads of one file fetch once.
+  const inFlight = new Map<string, Promise<void>>();
+
+  function fetchAsync(rel: string, abs: string): Promise<Buffer> {
+    const [cmd, args] = fetchCommand(rel);
+    return new Promise((resolve, reject) => {
+      const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+      const out: Buffer[] = [];
+      const err: Buffer[] = [];
+      child.stdout.on("data", (c: Buffer) => out.push(c));
+      child.stderr.on("data", (c: Buffer) => err.push(c));
+      child.on("error", (e: unknown) => reject(spawnFailure(cmd, rel, abs, e)));
+      child.on("close", (code: number | null) => {
+        if (code === 0) resolve(Buffer.concat(out));
+        else reject(fetchFailure(cmd, rel, abs, Buffer.concat(err).toString("utf-8").trim()));
+      });
+    });
+  }
+
+  function hydrateAsync(rel: string, abs: string): Promise<void> {
+    const existing = inFlight.get(rel);
+    if (existing) return existing;
+    const entry = files.get(rel);
+    if (!entry) return Promise.resolve();
+    const pending = fetchAsync(rel, abs)
+      .then((data) => {
+        publish(rel, abs, data, entry.mode);
+        sendIpc({ type: "hydrate_fetch", path: abs, rel, size: data.length });
+      })
+      .finally(() => inFlight.delete(rel));
+    inFlight.set(rel, pending);
+    return pending;
   }
 
   /** Make a manifest path real on disk: fetch files, mkdir directories. */
   function ensureMaterialized(p: unknown): void {
     const rel = relUnderRoot(p);
-    if (rel === null) return;
+    if (rel === null || !isManifestPath(rel) || isOnDisk(rel)) return;
     const abs = path.join(ROOT, rel);
-    if (orig.existsSync.call(fs, abs)) return;
     if (hasManifestFile(rel)) {
-      hydrate(rel, abs);
-    } else if (dirs.has(rel)) {
+      hydrateSync(rel, abs);
+    } else {
       orig.mkdirSync.call(fs, abs, { recursive: true });
+      onDisk.add(rel);
     }
+  }
+
+  /**
+   * Async twin of ensureMaterialized: the network fetch runs in a child
+   * process without blocking the event loop. Returns undefined when nothing
+   * needs fetching, so callers can take a synchronous fast path.
+   */
+  function ensureMaterializedAsync(p: unknown): Promise<void> | undefined {
+    const rel = relUnderRoot(p);
+    if (rel === null || !isManifestPath(rel) || isOnDisk(rel)) return undefined;
+    const abs = path.join(ROOT, rel);
+    if (hasManifestFile(rel)) return hydrateAsync(rel, abs);
+    orig.mkdirSync.call(fs, abs, { recursive: true });
+    onDisk.add(rel);
+    return undefined;
   }
 
   /** Create the parent directory on disk when the manifest says it exists. */
@@ -268,11 +393,9 @@ function install(rootInput: string): void {
     if (rel === null || rel === "") return;
     const parent = path.dirname(rel);
     const parentRel = parent === "." ? "" : parent;
-    if (parentRel === "" || !dirs.has(parentRel)) return;
-    const parentAbs = path.join(ROOT, parentRel);
-    if (!orig.existsSync.call(fs, parentAbs)) {
-      orig.mkdirSync.call(fs, parentAbs, { recursive: true });
-    }
+    if (parentRel === "" || !dirs.has(parentRel) || isOnDisk(parentRel)) return;
+    orig.mkdirSync.call(fs, path.join(ROOT, parentRel), { recursive: true });
+    onDisk.add(parentRel);
   }
 
   /** Whether open() flags require existing content (anything but truncate). */
@@ -281,10 +404,148 @@ function install(rootInput: string): void {
   }
 
   // -------------------------------------------------------------------------
-  // Generic wrappers: run an "ensure" step, then delegate to the original.
+  // Metadata without hydration: stat, lstat, access, realpath
+  //
+  // Claude Code's Glob stats every match to sort by mtime, so hydrating on
+  // stat would download every file a broad glob touches. For a manifest file
+  // that isn't on disk yet these answer from the manifest instead.
+  // -------------------------------------------------------------------------
+
+  // Synthetic mtime/ctime: the commit time of REF (commit objects are local
+  // in a blob-less clone), computed once on first use.
+  let refTimeMs: number | undefined;
+  function getRefTimeMs(): number {
+    if (refTimeMs === undefined) {
+      try {
+        refTimeMs = Number.parseInt(git(["show", "-s", "--format=%ct", REF]).trim(), 10) * 1000;
+      } catch {
+        refTimeMs = 0;
+      }
+      if (!Number.isFinite(refTimeMs)) refTimeMs = 0;
+    }
+    return refTimeMs;
+  }
+
+  let rootDev: number | undefined;
+  const syntheticInodes = new Map<string, number>();
+
+  /**
+   * A Stats object for an unhydrated manifest file.
+   *
+   * size is reported as 0: the real size lives only in the blob (or behind a
+   * GitHub API call), and `git cat-file -s` would itself download the blob in
+   * a blob-less clone, defeating the point. Hydrating reads report the real
+   * size afterwards, since the file is then on disk. Symlinks (mode 120000)
+   * are reported as regular files, matching how they are hydrated.
+   */
+  function syntheticFileStats(rel: string): unknown {
+    rootDev ??= orig.statSync.call(fs, ROOT).dev as number;
+    let ino = syntheticInodes.get(rel);
+    if (ino === undefined) {
+      ino = 2 ** 40 + syntheticInodes.size;
+      syntheticInodes.set(rel, ino);
+    }
+    const perm = files.get(rel)?.mode === "100755" ? 0o755 : 0o644;
+    const t = getRefTimeMs();
+    const stats = Object.create(fs.Stats.prototype);
+    const fields: Record<string, unknown> = {
+      dev: rootDev,
+      ino,
+      mode: 0o100000 | perm,
+      nlink: 1,
+      uid: process.getuid?.() ?? 0,
+      gid: process.getgid?.() ?? 0,
+      rdev: 0,
+      size: 0,
+      blksize: 4096,
+      blocks: 0,
+      atimeMs: t,
+      mtimeMs: t,
+      ctimeMs: t,
+      birthtimeMs: t,
+      atime: new Date(t),
+      mtime: new Date(t),
+      ctime: new Date(t),
+      birthtime: new Date(t),
+    };
+    // defineProperty (not assignment): Stats.prototype may define the date
+    // fields as getter-only accessors.
+    for (const [key, value] of Object.entries(fields)) {
+      Object.defineProperty(stats, key, { value, writable: true, enumerable: true });
+    }
+    // Don't rely on prototype predicates reading internal slots.
+    const kind = (mask: number) => () => (stats.mode & 0o170000) === mask;
+    Object.assign(stats, {
+      isFile: kind(0o100000),
+      isDirectory: kind(0o040000),
+      isSymbolicLink: kind(0o120000),
+      isBlockDevice: kind(0o060000),
+      isCharacterDevice: kind(0o020000),
+      isFIFO: kind(0o010000),
+      isSocket: kind(0o140000),
+    });
+    return stats;
+  }
+
+  /** Rel of a manifest file that is not on disk (and not tombstoned). */
+  function unhydratedFile(p: unknown): string | null {
+    const rel = relUnderRoot(p);
+    if (rel === null || !hasManifestFile(rel) || isOnDisk(rel)) return null;
+    return rel;
+  }
+
+  type Shortcut = (args: unknown[]) => { value: unknown } | { error: unknown } | null;
+
+  const statShortcut: Shortcut = (args) => {
+    const options = args[1] as { bigint?: boolean } | undefined;
+    // BigInt stats are rare; those fall through to hydrate + real stat.
+    if (options && typeof options === "object" && options.bigint) return null;
+    const rel = unhydratedFile(args[0]);
+    return rel === null ? null : { value: syntheticFileStats(rel) };
+  };
+
+  const accessShortcut: Shortcut = (args) => {
+    const rel = unhydratedFile(args[0]);
+    if (rel === null) return null;
+    const mode = typeof args[1] === "number" ? args[1] : 0;
+    if (mode & fs.constants.X_OK && files.get(rel)?.mode !== "100755") {
+      return {
+        error: Object.assign(new Error(`EACCES: permission denied, access '${args[0]}'`), {
+          code: "EACCES",
+          errno: -13,
+          syscall: "access",
+          path: args[0],
+        }),
+      };
+    }
+    return { value: undefined };
+  };
+
+  let realRoot: string | undefined;
+
+  const realpathShortcut: Shortcut = (args) => {
+    const rel = relUnderRoot(args[0]);
+    if (rel === null || !isManifestPath(rel) || isOnDisk(rel)) return null;
+    // Nothing under ROOT is on disk at this path, so no symlinks can sit
+    // between ROOT and it: resolving ROOT itself is enough.
+    realRoot ??= orig.realpathSync.call(fs, ROOT) as string;
+    const resolved = path.join(realRoot, rel);
+    const options = args[1];
+    const encoding =
+      typeof options === "string" ? options : (options as { encoding?: string })?.encoding;
+    return { value: encoding === "buffer" ? Buffer.from(resolved) : resolved };
+  };
+
+  // -------------------------------------------------------------------------
+  // Generic wrappers
   // -------------------------------------------------------------------------
 
   type Ensure = (args: unknown[]) => void;
+  type EnsureAsync = (args: unknown[]) => Promise<void> | undefined;
+  type AnyFn = (...args: never[]) => unknown;
+  type LooseFn = (this: unknown, ...args: unknown[]) => unknown;
+
+  const loose = (fn: AnyFn) => fn as unknown as LooseFn;
 
   const ensureRead: Ensure = (args) => ensureMaterialized(args[0]);
   const ensureWrite: Ensure = (args) => ensureParentDir(args[0]);
@@ -302,88 +563,199 @@ function install(rootInput: string): void {
     ensureParentDir(args[1]);
   };
 
-  type AnyFn = (...args: never[]) => unknown;
+  const ensureReadAsync: EnsureAsync = (args) => ensureMaterializedAsync(args[0]);
+  const ensureWriteAsync: EnsureAsync = (args) => {
+    ensureParentDir(args[0]);
+    return undefined;
+  };
+  const ensureAppendAsync: EnsureAsync = (args) => {
+    const pending = ensureMaterializedAsync(args[0]);
+    ensureParentDir(args[0]);
+    return pending;
+  };
+  const ensureOpenAsync: EnsureAsync = (args) => {
+    const pending = flagsNeedContent(args[1]) ? ensureMaterializedAsync(args[0]) : undefined;
+    ensureParentDir(args[0]);
+    return pending;
+  };
+  const ensureCopyAsync: EnsureAsync = (args) => {
+    const pending = ensureMaterializedAsync(args[0]);
+    ensureParentDir(args[1]);
+    return pending;
+  };
 
   function withEnsureSync<F extends AnyFn>(original: F, ensure: Ensure): F {
+    const call = loose(original);
     return function (this: unknown, ...args: unknown[]) {
       ensure(args);
-      return (original as (...a: unknown[]) => unknown).apply(this, args);
-    } as F;
+      return call.apply(this, args);
+    } as unknown as F;
   }
 
-  function withEnsureCallback<F extends AnyFn>(original: F, ensure: Ensure): F {
+  /**
+   * Callback-style wrapper: hydrate asynchronously, then call the original
+   * with the caller's callback; fetch errors go to the callback. When nothing
+   * needs fetching the original is called synchronously, as before.
+   */
+  function withEnsureCallback<F extends AnyFn>(
+    original: F,
+    ensure: EnsureAsync,
+    ensureSync: Ensure,
+  ): F {
+    const call = loose(original);
     return function (this: unknown, ...args: unknown[]) {
-      const maybeCb = args[args.length - 1];
+      const cb = args[args.length - 1];
+      if (typeof cb !== "function") {
+        // No callback: let the original raise its usual argument error.
+        ensureSync(args);
+        return call.apply(this, args);
+      }
+      let pending: Promise<void> | undefined;
       try {
-        ensure(args);
+        pending = ensure(args);
       } catch (err) {
-        if (typeof maybeCb === "function") {
-          process.nextTick(maybeCb as (e: unknown) => void, err);
+        process.nextTick(cb, err);
+        return;
+      }
+      if (!pending) return call.apply(this, args);
+      pending.then(
+        () => {
+          try {
+            call.apply(this, args);
+          } catch (err) {
+            cb(err);
+          }
+        },
+        (err) => cb(err),
+      );
+    } as unknown as F;
+  }
+
+  function withEnsureAsync<F extends AnyFn>(original: F, ensure: EnsureAsync): F {
+    const call = loose(original);
+    return async function (this: unknown, ...args: unknown[]) {
+      await ensure(args);
+      return call.apply(this, args);
+    } as unknown as F;
+  }
+
+  function withShortcutSync<F extends AnyFn>(fallback: F, shortcut: Shortcut): F {
+    const call = loose(fallback);
+    return function (this: unknown, ...args: unknown[]) {
+      const r = shortcut(args);
+      if (r) {
+        if ("error" in r) throw r.error;
+        return r.value;
+      }
+      return call.apply(this, args);
+    } as unknown as F;
+  }
+
+  function withShortcutCallback<F extends AnyFn>(fallback: F, shortcut: Shortcut): F {
+    const call = loose(fallback);
+    return function (this: unknown, ...args: unknown[]) {
+      const cb = args[args.length - 1];
+      if (typeof cb === "function") {
+        const r = shortcut(args.slice(0, -1));
+        if (r) {
+          if ("error" in r) process.nextTick(cb, r.error);
+          else process.nextTick(cb, null, r.value);
           return;
         }
-        throw err;
       }
-      return (original as (...a: unknown[]) => unknown).apply(this, args);
-    } as F;
+      return call.apply(this, args);
+    } as unknown as F;
   }
 
-  function withEnsureAsync<F extends AnyFn>(original: F, ensure: Ensure): F {
+  function withShortcutAsync<F extends AnyFn>(fallback: F, shortcut: Shortcut): F {
+    const call = loose(fallback);
     return async function (this: unknown, ...args: unknown[]) {
-      ensure(args);
-      return (original as (...a: unknown[]) => unknown).apply(this, args);
-    } as F;
+      const r = shortcut(args);
+      if (r) {
+        if ("error" in r) throw r.error;
+        return r.value;
+      }
+      return call.apply(this, args);
+    } as unknown as F;
   }
 
   // -------------------------------------------------------------------------
   // Patch fs
   // -------------------------------------------------------------------------
 
+  // Content reads hydrate.
   fs.readFileSync = withEnsureSync(orig.readFileSync, ensureRead);
-  fs.statSync = withEnsureSync(orig.statSync, ensureRead);
-  fs.lstatSync = withEnsureSync(orig.lstatSync, ensureRead);
-  fs.accessSync = withEnsureSync(orig.accessSync, ensureRead);
   fs.openSync = withEnsureSync(orig.openSync, ensureOpen);
   fs.writeFileSync = withEnsureSync(orig.writeFileSync, ensureWrite);
   fs.appendFileSync = withEnsureSync(orig.appendFileSync, ensureAppend);
   fs.copyFileSync = withEnsureSync(orig.copyFileSync, ensureCopy);
-  fs.realpathSync = Object.assign(withEnsureSync(orig.realpathSync, ensureRead), {
-    native: withEnsureSync(orig.realpathSyncNative, ensureRead),
-  });
 
-  fs.readFile = withEnsureCallback(orig.readFile, ensureRead);
-  fs.stat = withEnsureCallback(orig.stat, ensureRead);
-  fs.lstat = withEnsureCallback(orig.lstat, ensureRead);
-  fs.access = withEnsureCallback(orig.access, ensureRead);
-  fs.open = withEnsureCallback(orig.open, ensureOpen);
-  fs.writeFile = withEnsureCallback(orig.writeFile, ensureWrite);
-  fs.appendFile = withEnsureCallback(orig.appendFile, ensureAppend);
-  fs.copyFile = withEnsureCallback(orig.copyFile, ensureCopy);
-  fs.realpath = Object.assign(withEnsureCallback(orig.realpath, ensureRead), {
-    native: orig.realpath.native ? withEnsureCallback(orig.realpath.native, ensureRead) : undefined,
-  });
+  fs.readFile = withEnsureCallback(orig.readFile, ensureReadAsync, ensureRead);
+  fs.open = withEnsureCallback(orig.open, ensureOpenAsync, ensureOpen);
+  fs.writeFile = withEnsureCallback(orig.writeFile, ensureWriteAsync, ensureWrite);
+  fs.appendFile = withEnsureCallback(orig.appendFile, ensureAppendAsync, ensureAppend);
+  fs.copyFile = withEnsureCallback(orig.copyFile, ensureCopyAsync, ensureCopy);
 
-  promises.readFile = withEnsureAsync(origPromises.readFile, ensureRead);
-  promises.stat = withEnsureAsync(origPromises.stat, ensureRead);
-  promises.lstat = withEnsureAsync(origPromises.lstat, ensureRead);
-  promises.access = withEnsureAsync(origPromises.access, ensureRead);
-  promises.open = withEnsureAsync(origPromises.open, ensureOpen);
-  promises.realpath = withEnsureAsync(origPromises.realpath, ensureRead);
-  promises.writeFile = withEnsureAsync(origPromises.writeFile, ensureWrite);
-  promises.appendFile = withEnsureAsync(origPromises.appendFile, ensureAppend);
-  promises.copyFile = withEnsureAsync(origPromises.copyFile, ensureCopy);
+  promises.readFile = withEnsureAsync(origPromises.readFile, ensureReadAsync);
+  promises.open = withEnsureAsync(origPromises.open, ensureOpenAsync);
+  promises.writeFile = withEnsureAsync(origPromises.writeFile, ensureWriteAsync);
+  promises.appendFile = withEnsureAsync(origPromises.appendFile, ensureAppendAsync);
+  promises.copyFile = withEnsureAsync(origPromises.copyFile, ensureCopyAsync);
+
+  // Metadata answers from the manifest for unhydrated files; the fallback
+  // (on-disk files, directories, bigint stats) keeps the old behavior.
+  fs.statSync = withShortcutSync(withEnsureSync(orig.statSync, ensureRead), statShortcut);
+  fs.lstatSync = withShortcutSync(withEnsureSync(orig.lstatSync, ensureRead), statShortcut);
+  fs.accessSync = withShortcutSync(withEnsureSync(orig.accessSync, ensureRead), accessShortcut);
+  fs.stat = withShortcutCallback(
+    withEnsureCallback(orig.stat, ensureReadAsync, ensureRead),
+    statShortcut,
+  );
+  fs.lstat = withShortcutCallback(
+    withEnsureCallback(orig.lstat, ensureReadAsync, ensureRead),
+    statShortcut,
+  );
+  fs.access = withShortcutCallback(
+    withEnsureCallback(orig.access, ensureReadAsync, ensureRead),
+    accessShortcut,
+  );
+  promises.stat = withShortcutAsync(
+    withEnsureAsync(origPromises.stat, ensureReadAsync),
+    statShortcut,
+  );
+  promises.lstat = withShortcutAsync(
+    withEnsureAsync(origPromises.lstat, ensureReadAsync),
+    statShortcut,
+  );
+  promises.access = withShortcutAsync(
+    withEnsureAsync(origPromises.access, ensureReadAsync),
+    accessShortcut,
+  );
+
+  // realpath never hydrates: a manifest path not on disk resolves under ROOT.
+  fs.realpathSync = Object.assign(withShortcutSync(orig.realpathSync, realpathShortcut), {
+    native: withShortcutSync(orig.realpathSyncNative, realpathShortcut),
+  });
+  fs.realpath = Object.assign(withShortcutCallback(orig.realpath, realpathShortcut), {
+    native: orig.realpathNative
+      ? withShortcutCallback(orig.realpathNative, realpathShortcut)
+      : undefined,
+  });
+  promises.realpath = withShortcutAsync(origPromises.realpath, realpathShortcut);
 
   // --- existsSync: answer from disk first, then the manifest ---
 
   fs.existsSync = function (p: unknown): boolean {
     if (orig.existsSync.call(this, p)) return true;
     const rel = relUnderRoot(p);
-    return rel !== null && (hasManifestFile(rel) || dirs.has(rel));
+    return rel !== null && isManifestPath(rel);
   };
 
   // --- unlink: deleting an unhydrated manifest file is a tombstone ---
 
   /** Returns true when the delete was satisfied without touching disk. */
   function virtualUnlink(p: unknown): boolean {
+    forgetOnDisk(p);
     const rel = relUnderRoot(p);
     if (rel === null || !hasManifestFile(rel)) return false;
     deleted.add(rel);
@@ -430,26 +802,23 @@ function install(rootInput: string): void {
     };
   }
 
-  /** Manifest entries under `rel`, as [name-relative-to-rel, kind] pairs. */
+  /**
+   * Manifest entries under `rel`, as [name-relative-to-rel, kind] pairs.
+   * Recursive listings walk the per-directory index from `rel`, so the cost
+   * is proportional to the subtree rather than the whole repo.
+   */
   function virtualEntries(rel: string, recursive: boolean): Array<[string, "file" | "dir"]> {
-    if (!recursive) {
-      const out: Array<[string, "file" | "dir"]> = [];
-      for (const [name, kind] of childrenByDir.get(rel) ?? []) {
-        const childRel = rel === "" ? name : `${rel}/${name}`;
-        if (kind === "file" && deleted.has(childRel)) continue;
-        out.push([name, kind]);
-      }
-      return out;
-    }
-    const prefix = rel === "" ? "" : rel + "/";
     const out: Array<[string, "file" | "dir"]> = [];
-    for (const f of files.keys()) {
-      if (deleted.has(f)) continue;
-      if (prefix === "" || f.startsWith(prefix)) out.push([f.slice(prefix.length), "file"]);
-    }
-    for (const d of dirs) {
-      if (d === "" || d === rel) continue;
-      if (prefix === "" || d.startsWith(prefix)) out.push([d.slice(prefix.length), "dir"]);
+    const stack: Array<[string, string]> = [[rel, ""]];
+    while (stack.length > 0) {
+      const [dirRel, prefix] = stack.pop()!;
+      for (const [name, kind] of childrenByDir.get(dirRel) ?? []) {
+        const childRel = dirRel === "" ? name : `${dirRel}/${name}`;
+        if (kind === "file" && deleted.has(childRel)) continue;
+        const display = prefix === "" ? name : `${prefix}/${name}`;
+        out.push([display, kind]);
+        if (recursive && kind === "dir") stack.push([childRel, display]);
+      }
     }
     return out;
   }
@@ -491,14 +860,19 @@ function install(rootInput: string): void {
     }
 
     const abs = path.join(ROOT, rel);
-    if (!orig.existsSync.call(fs, abs)) {
-      orig.mkdirSync.call(fs, abs, { recursive: true });
-    }
+    ensureMaterialized(abs);
 
     const opts = normalizeReaddirOpts(options);
     const diskEntries: unknown[] = orig.readdirSync.call(fs, abs, options);
-    const seen = new Set(diskEntries.map((e) => entryKey(e, abs)));
-    const merged = diskEntries.slice();
+    const merged: unknown[] = [];
+    const seen = new Set<string>();
+    for (const e of diskEntries) {
+      const key = entryKey(e, abs);
+      // Hide in-flight hydration temp files (see publish()).
+      if (TMP_NAME.test(path.posix.basename(key))) continue;
+      seen.add(key);
+      merged.push(e);
+    }
 
     for (const [name, kind] of virtualEntries(rel, opts.recursive)) {
       if (seen.has(name)) continue;
