@@ -15,7 +15,14 @@ import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import { mkdtempSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
-import { bloblessClone, ghAvailable, hydrateEnv } from "./blobless-clone";
+import {
+  bloblessClone,
+  cloneSizeBytes,
+  fetchCheckoutSize,
+  ghAvailable,
+  hydrateEnv,
+  type CheckoutSize,
+} from "./blobless-clone";
 import { buildChildEnv } from "./child-env";
 import { runSession, type SessionOptions } from "./run-session";
 
@@ -39,6 +46,13 @@ export interface RemotePlanSession {
   root: string;
   /** The commit sha the session is planning against. */
   ref: string;
+  /** Bandwidth context for session stats. */
+  workspace: {
+    /** Bytes the blob-less clone downloaded (commits and trees). */
+    cloneBytes?: number;
+    /** Size of the full checkout, when GitHub's trees API can tell. */
+    checkout: Promise<CheckoutSize | undefined>;
+  };
 }
 
 export function planRemoteRepo(options: RemotePlanOptions): RemotePlanSession {
@@ -49,11 +63,18 @@ export function planRemoteRepo(options: RemotePlanOptions): RemotePlanSession {
   const strategy = options.strategy ?? (ghAvailable() ? "gh" : "git");
   const root = mkdtempSync(path.join(tmpdir(), "cc-planner-"));
   const clone = bloblessClone(options.repo, root, options.branch);
+  // Measure now: blobs the git strategy fetches later land in the same packs.
+  const cloneBytes = cloneSizeBytes(root);
   const session = runSession(options, {
     cwd: root,
     env: { ...buildChildEnv(), ...hydrateEnv(clone, strategy) },
     preloads: ["vfs-hydrate.ts"],
   });
 
-  return { session, root, ref: clone.ref };
+  return {
+    session,
+    root,
+    ref: clone.ref,
+    workspace: { cloneBytes, checkout: fetchCheckoutSize(options.repo, clone.ref) },
+  };
 }

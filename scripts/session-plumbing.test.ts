@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "child_process";
-import { mkdirSync, mkdtempSync, readlinkSync, realpathSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, readlinkSync, realpathSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -63,10 +63,11 @@ test("plan capture - hook reports Write/Edit of files in the plans dir only", as
   mkdirSync(path.join(ws, ".git"));
   const dir = plansDirectoryPath(ws);
   expect(dir).toBe(path.join(ws, PLANS_SUBDIR));
-  mkdirSync(dir, { recursive: true });
 
+  // Hooks are built before Claude Code creates the plans dir.
   const seen: [string, string][] = [];
   const [matcher] = planCaptureHooks(dir, (content, filename) => seen.push([filename, content]));
+  mkdirSync(dir, { recursive: true });
   expect(matcher.matcher).toBe("Write|Edit|MultiEdit");
   const fire = (tool: string, filePath: string) =>
     matcher.hooks[0](
@@ -128,4 +129,32 @@ test("describeCloneFailure - turns git clone stderr into an actionable message",
   expect(
     describeCloneFailure("o/r", undefined, "Cloning into 'x'...\nfatal: unable to access\n"),
   ).toBe("Cloning o/r failed: fatal: unable to access");
+});
+
+test("plan capture - matches writes via the realpath of a symlinked workspace", async () => {
+  // macOS: the workspace is /var/folders/... (a symlink) but Claude Code
+  // writes through /private/var/folders/..., and the plans dir doesn't exist
+  // until the first write.
+  const real = mkdtempSync(path.join(tmpdir(), "plan-capture-real-"));
+  mkdirSync(path.join(real, ".git"));
+  const link = `${real}-link`;
+  symlinkSync(real, link);
+
+  const seen: string[] = [];
+  const [matcher] = planCaptureHooks(plansDirectoryPath(link), (_content, filename) =>
+    seen.push(filename),
+  );
+  mkdirSync(path.join(real, PLANS_SUBDIR));
+  const plan = path.join(real, PLANS_SUBDIR, "p.md");
+  writeFileSync(plan, "# plan\n");
+  await matcher.hooks[0](
+    {
+      hook_event_name: "PostToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: plan },
+    } as never,
+    "tu",
+    { signal: new AbortController().signal },
+  );
+  expect(seen).toEqual(["p.md"]);
 });

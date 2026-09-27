@@ -29,6 +29,7 @@ import type {
 import { planBakedRepo, resolveBakedRef } from "../../scripts/lib/plan-baked";
 import { planRemoteRepo } from "../../scripts/lib/plan-remote";
 import type { VfsMessage } from "../../scripts/lib/spawn-vfs";
+import { PLANS_SUBDIR } from "../../scripts/lib/plan-capture";
 import { PLAN_WORKFLOW_INSTRUCTIONS, stopDecision } from "../../scripts/lib/plan-workflow";
 import { evaluateBashCommand, HYDRATION_GUIDANCE } from "./bash-policy";
 import { estimateModelCostUsd } from "./pricing";
@@ -42,6 +43,7 @@ import type {
   SessionStats,
   TokenUsage,
   UserQuestion,
+  WorkspaceStats,
 } from "./protocol";
 
 // ---------------------------------------------------------------------------
@@ -147,6 +149,11 @@ export interface RunnerResult {
   session: AsyncIterable<SDKMessage> & { interrupt?: () => Promise<unknown> };
   repo: string;
   ref: string;
+  /** Lazy workspaces: bandwidth context for stats. */
+  workspace?: {
+    cloneBytes?: number;
+    checkout: Promise<{ files: number; bytes: number } | undefined>;
+  };
 }
 
 export type SessionRunner = (args: RunnerArgs) => RunnerResult;
@@ -179,8 +186,8 @@ export function makeRunner(defaultMode: RepoMode): SessionRunner {
     if (!repo) {
       throw new Error('A repository ("owner/repo") or a local folder is required');
     }
-    const { session, ref } = planRemoteRepo({ ...args, repo });
-    return { session, repo, ref };
+    const { session, ref, workspace } = planRemoteRepo({ ...args, repo });
+    return { session, repo, ref, workspace };
   };
 }
 
@@ -214,6 +221,15 @@ export function summarizeToolInput(input: Record<string, unknown>): string {
     }
   }
   return "";
+}
+
+/** A path inside a plans directory (the workspace's or the default one). */
+export function isPlanFile(filePath: unknown): boolean {
+  if (typeof filePath !== "string") return false;
+  const dir = path.dirname(filePath).split(path.sep).join("/");
+  return (
+    dir.endsWith(`/${PLANS_SUBDIR.split(path.sep).join("/")}`) || dir.endsWith("/.claude/plans")
+  );
 }
 
 /** Largest file content (bytes) included in a diff payload. */
@@ -351,6 +367,8 @@ export class ClaudeSession {
   private readonly liveUsageByMessage = new Map<string, { model: string; usage: TokenUsage }>();
   private filesHydrated = 0;
   private bytesFetched = 0;
+  /** Lazy workspaces only; filled in as the numbers become known. */
+  private workspaceStats?: WorkspaceStats;
   private lastLiveStatsAt = 0;
   private liveStatsTimer?: ReturnType<typeof setTimeout>;
 
@@ -379,7 +397,7 @@ export class ClaudeSession {
     ].filter((part): part is string => Boolean(part));
 
     try {
-      const { session, repo, ref } = this.runner({
+      const { session, repo, ref, workspace } = this.runner({
         prompt: this.input,
         permissionMode: mode,
         appendSystemPrompt: appendParts.length ? appendParts.join("\n\n") : undefined,
@@ -415,6 +433,18 @@ export class ClaudeSession {
       });
       this.session = session;
       this.send({ type: "session_started", repo, ref });
+      if (workspace) {
+        this.workspaceStats = { ...this.workspaceStats, cloneBytes: workspace.cloneBytes };
+        void workspace.checkout.then((checkout) => {
+          if (!checkout) return;
+          this.workspaceStats = {
+            ...this.workspaceStats,
+            totalFiles: this.workspaceStats?.totalFiles ?? checkout.files,
+            totalBytes: checkout.bytes,
+          };
+          this.sendLiveStats();
+        });
+      }
 
       for await (const msg of session) {
         this.handleSdkMessage(msg);
@@ -686,6 +716,7 @@ export class ClaudeSession {
 
   private handleVfsMessage(msg: VfsMessage): void {
     if (msg.type === "hydrate_init") {
+      this.workspaceStats = { ...this.workspaceStats, totalFiles: Number(msg.files) };
       this.send({ type: "hydrate_init", files: Number(msg.files) });
     } else if (msg.type === "hydrate_fetch") {
       this.filesHydrated += 1;
@@ -766,6 +797,7 @@ export class ClaudeSession {
         byModel,
         filesHydrated: this.filesHydrated,
         bytesFetched: this.bytesFetched,
+        workspace: this.workspaceStats,
         final: false,
       },
     });
@@ -788,7 +820,8 @@ export class ClaudeSession {
               type: "tool_activity",
               name: block.name,
               detail: summarizeToolInput(input),
-              diff: extractDiff(block.name, input),
+              // Plan-file writes render in the plan panel, not as diffs.
+              diff: isPlanFile(input.file_path) ? undefined : extractDiff(block.name, input),
             });
           }
         }
@@ -835,6 +868,7 @@ export class ClaudeSession {
             byModel,
             filesHydrated: this.filesHydrated,
             bytesFetched: this.bytesFetched,
+            workspace: this.workspaceStats,
             final: true,
           },
         });

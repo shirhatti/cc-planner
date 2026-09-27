@@ -14,6 +14,7 @@ import {
   expandHome,
   gatewayEnv,
   ClaudeSession,
+  isPlanFile,
   makeRunner,
   resolveRepoMode,
   summarizeToolInput,
@@ -149,6 +150,17 @@ describe("pricing", () => {
   test("matches date-suffixed model IDs by longest prefix", () => {
     // claude-opus-4-8 must not fall through to the claude-opus-4 (4.0) rates
     expect(priceForModel("claude-opus-4-8")?.inputPerMTok).toBe(5);
+    // Claude 5 models, longest prefix first (opus-5-5 is not opus-5).
+    expect(priceForModel("claude-opus-5-5")).toMatchObject({
+      inputPerMTok: 4,
+      outputPerMTok: 20,
+      cacheReadPerMTok: 0.2,
+      cacheWritePerMTok: 5,
+    });
+    expect(priceForModel("claude-opus-5")?.inputPerMTok).toBe(5);
+    expect(priceForModel("claude-sonnet-5")?.outputPerMTok).toBe(10);
+    expect(priceForModel("claude-fable-5-1")?.cacheReadPerMTok).toBe(0.25);
+    expect(priceForModel("claude-fable-5")?.cacheReadPerMTok).toBe(1);
     expect(priceForModel("claude-opus-4-20250514")?.inputPerMTok).toBe(15);
     expect(priceForModel("claude-sonnet-4-5-20250929")?.outputPerMTok).toBe(15);
     expect(priceForModel("claude-haiku-4-5-20251001")?.cacheReadPerMTok).toBeCloseTo(0.1);
@@ -172,6 +184,18 @@ describe("pricing", () => {
         cacheCreationTokens: 0,
       }),
     ).toBeUndefined();
+  });
+});
+
+describe("isPlanFile", () => {
+  test("recognizes the workspace and default plans dirs only", () => {
+    expect(isPlanFile("/private/var/folders/x/T/cc-planner-a/.git/cc-planner-plans/p.md")).toBe(
+      true,
+    );
+    expect(isPlanFile("/Users/me/.claude/plans/p.md")).toBe(true);
+    expect(isPlanFile("/tmp/ws/src/index.ts")).toBe(false);
+    expect(isPlanFile("/tmp/ws/.git/cc-planner-plans/nested/p.md")).toBe(false);
+    expect(isPlanFile(undefined)).toBe(false);
   });
 });
 

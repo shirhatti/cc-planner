@@ -17,17 +17,17 @@ export interface ModelPricing {
   inputPerMTok: number;
   /** USD per million output tokens. */
   outputPerMTok: number;
-  /** USD per million cache-read tokens (0.1x input). */
+  /** USD per million cache-read tokens (0.1x input unless the model lists its own). */
   cacheReadPerMTok: number;
   /** USD per million cache-write tokens (5m TTL, 1.25x input). */
   cacheWritePerMTok: number;
 }
 
-function rates(input: number, output: number): ModelPricing {
+function rates(input: number, output: number, cacheRead = input * 0.1): ModelPricing {
   return {
     inputPerMTok: input,
     outputPerMTok: output,
-    cacheReadPerMTok: input * 0.1,
+    cacheReadPerMTok: cacheRead,
     cacheWritePerMTok: input * 1.25,
   };
 }
@@ -37,7 +37,12 @@ function rates(input: number, output: number): ModelPricing {
  * (e.g. "claude-sonnet-4-5-20250929"), so lookup is by longest prefix.
  */
 const PRICING: Record<string, ModelPricing> = {
+  // Claude Fable 5.1 and Opus 5.5 list cache reads below the usual 0.1x.
+  "claude-fable-5-1": rates(10, 50, 0.25),
   "claude-fable-5": rates(10, 50),
+  "claude-opus-5-5": rates(4, 20, 0.2),
+  "claude-opus-5": rates(5, 25),
+  "claude-sonnet-5": rates(2, 10),
   "claude-opus-4-8": rates(5, 25),
   "claude-opus-4-7": rates(5, 25),
   "claude-opus-4-6": rates(5, 25),

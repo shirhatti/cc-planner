@@ -54,6 +54,20 @@ export interface TokenUsage {
  * each assistant turn, then with `final: true` after each completed turn,
  * built from the SDK's authoritative token counts.
  */
+/**
+ * What a lazy workspace downloaded versus what a full clone would need.
+ * Fields are absent when unknown (e.g. a private repo without gh, or a tree
+ * too large for GitHub's trees API).
+ */
+export interface WorkspaceStats {
+  /** Files in the repo at the planned commit (from the manifest). */
+  totalFiles?: number;
+  /** Total size of those files — a full checkout's working tree. */
+  totalBytes?: number;
+  /** Bytes the blob-less clone downloaded (commits and trees). */
+  cloneBytes?: number;
+}
+
 export interface SessionStats {
   durationMs: number;
   /** Time spent waiting on the API (final stats only). */
@@ -75,6 +89,8 @@ export interface SessionStats {
   filesHydrated: number;
   /** Bytes of repo content fetched during hydration (lazy mode only). */
   bytesFetched: number;
+  /** Bandwidth context for lazy workspaces (absent for full checkouts). */
+  workspace?: WorkspaceStats;
   final: boolean;
 }
 

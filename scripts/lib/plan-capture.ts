@@ -40,13 +40,12 @@ export function plansDirectoryPath(
   return path.join(env.CLAUDE_CONFIG_DIR || path.join(homedir(), ".claude"), "plans");
 }
 
-/** The path plus its realpath (macOS: /var/folders → /private/var/folders). */
-function spellings(p: string): string[] {
-  const resolved = path.resolve(p);
+/** realpath, or the resolved path when it doesn't exist (yet). */
+function realOrResolved(p: string): string {
   try {
-    return [...new Set([resolved, realpathSync(resolved)])];
+    return realpathSync(p);
   } catch {
-    return [resolved];
+    return path.resolve(p);
   }
 }
 
@@ -58,12 +57,14 @@ export function planCaptureHooks(
   plansDir: string,
   onPlan: (content: string, filename: string) => void,
 ): HookCallbackMatcher[] {
-  const dirs = spellings(plansDir);
   const hook: HookCallback = async (input) => {
     if (input.hook_event_name !== "PostToolUse") return {};
     const filePath = (input.tool_input as { file_path?: unknown } | undefined)?.file_path;
     if (typeof filePath !== "string" || !filePath.endsWith(".md")) return {};
-    if (!dirs.includes(path.dirname(path.resolve(filePath)))) return {};
+    // Compare real paths now, when both exist: the plans dir is created by
+    // the first plan write, and Claude Code may report the realpath'd
+    // spelling (macOS: /var/folders → /private/var/folders).
+    if (realOrResolved(path.dirname(filePath)) !== realOrResolved(plansDir)) return {};
     try {
       onPlan(readFileSync(filePath, "utf-8"), path.basename(filePath));
     } catch {

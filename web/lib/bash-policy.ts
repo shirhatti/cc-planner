@@ -933,6 +933,7 @@ export function evaluateBashCommand(
 export const HYDRATION_GUIDANCE = `
 This workspace is a blob-less git clone: the full directory tree is always visible to the Glob/LS/Read tools, but file contents are fetched over the network the first time each file is read. Work with that, not against it:
 - The working tree looks EMPTY to shell commands (ls, find) — that is expected, not an error or a sparse checkout. The manifest-backed tools see everything; do not probe the checkout configuration.
+- git status reports every file as deleted for the same reason (nothing is checked out). That is not a real change to the repo: ignore it, and don't mention it in the plan.
 - Use the Glob and LS tools to explore structure — they are served from the repo manifest and fetch nothing.
 - Use the Read tool for file contents — it hydrates exactly the files you read.
 - The Grep tool and shell commands run outside this layer: they only see files that have already been read. Locate files with Glob and Read the relevant ones rather than searching broadly.
