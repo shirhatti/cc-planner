@@ -10,7 +10,7 @@
  * where build.copy placed copies of preload/ and the native claude binary.
  */
 
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { createRequire } from "module";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -72,7 +72,25 @@ export function claudeExecutablePath(): string {
   const pkg = nativePackageName();
   const dir = resolvePackageDir(pkg);
   if (!dir) {
-    throw new Error(`Claude Code binary package ${pkg} is not installed — run \`bun install\``);
+    // Usually node_modules predates the SDK upgrade that introduced the
+    // native binary (pulled new code without re-installing).
+    const sdkDir = resolvePackageDir("@anthropic-ai/claude-agent-sdk");
+    let installed = "not installed";
+    try {
+      if (sdkDir) {
+        installed = (
+          JSON.parse(readFileSync(path.join(sdkDir, "package.json"), "utf-8")) as {
+            version: string;
+          }
+        ).version;
+      }
+    } catch {
+      // keep "not installed"
+    }
+    throw new Error(
+      `Claude Code binary package ${pkg} is not installed (installed @anthropic-ai/claude-agent-sdk: ${installed}). ` +
+        "Run `bun install` in the cc-planner checkout to install the SDK version in bun.lock, which includes the native binary for this platform.",
+    );
   }
   const bin = path.join(dir, BINARY_NAME);
   if (!existsSync(bin)) throw new Error(`Claude Code binary not found at ${bin}`);
