@@ -33,8 +33,12 @@ const QUESTIONS = [
   },
 ];
 
-function toolOptions(toolUseID: string): { toolUseID: string; signal: AbortSignal } {
-  return { toolUseID, signal: new AbortController().signal };
+function toolOptions(toolUseID: string): {
+  toolUseID: string;
+  requestId: string;
+  signal: AbortSignal;
+} {
+  return { toolUseID, requestId: `req_${toolUseID}`, signal: new AbortController().signal };
 }
 
 /** Builds a runner whose "session" just runs `body` and yields its messages. */
@@ -173,7 +177,7 @@ describe("pricing", () => {
 
 describe("ClaudeSession", () => {
   test("AskUserQuestion round-trips answers from the browser", async () => {
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     const sent: SessionEvent[] = [];
     const runner = fakeRunner(async function* (args) {
       results.push(
@@ -208,7 +212,7 @@ describe("ClaudeSession", () => {
   });
 
   test("plan approval allows ExitPlanMode and interrupts the session", async () => {
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     const sent: SessionEvent[] = [];
     let interrupted = false;
 
@@ -246,7 +250,7 @@ describe("ClaudeSession", () => {
   });
 
   test("plan rejection denies ExitPlanMode with the user's feedback", async () => {
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     const runner = fakeRunner(async function* (args) {
       results.push(await args.canUseTool("ExitPlanMode", {}, toolOptions("tu_3")));
       yield* [] as SDKMessage[];
@@ -310,47 +314,8 @@ describe("ClaudeSession", () => {
     });
   });
 
-  test("plan approval without stopOnPlanApproval lets the session continue", async () => {
-    const results: PermissionResult[] = [];
-    const sent: SessionEvent[] = [];
-    let interrupted = false;
-
-    const runner: SessionRunner = (args) => {
-      const gen = (async function* () {
-        results.push(
-          await args.canUseTool("ExitPlanMode", { allowedPrompts: [] }, toolOptions("tu_c")),
-        );
-        yield* [] as SDKMessage[];
-      })() as RunnerResult["session"];
-      gen.interrupt = async () => {
-        interrupted = true;
-      };
-      return { session: gen, repo: "owner/repo", ref: "abc123def456" };
-    };
-
-    const session: ClaudeSession = new ClaudeSession((msg) => {
-      sent.push(msg);
-      if (msg.type === "plan_review") {
-        session.handleClientMessage({
-          type: "plan_decision",
-          sessionId: "s1",
-          id: msg.id,
-          approved: true,
-        });
-        session.handleClientMessage({ type: "end_session", sessionId: "s1" });
-      }
-    }, runner);
-
-    await session.start({ prompt: "p", mode: "plan", stopOnPlanApproval: false });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-
-    expect(results[0]?.behavior).toBe("allow");
-    expect(interrupted).toBe(false);
-    expect(sent.some((m) => m.type === "plan_decided" && m.approved)).toBe(true);
-  });
-
   test("gated tools become browser permission requests", async () => {
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     const sent: SessionEvent[] = [];
     const runner = fakeRunner(async function* (args) {
       results.push(await args.canUseTool("Bash", { command: "bun test" }, toolOptions("tu_a")));
@@ -395,7 +360,7 @@ describe("ClaudeSession", () => {
       }
     }, runner);
 
-    await session.start({ prompt: "p", mode: "default" });
+    await session.start({ prompt: "p" });
 
     expect(results[0]).toEqual({
       behavior: "allow",
@@ -419,7 +384,7 @@ describe("ClaudeSession", () => {
 
   test("hydrating workspaces enforce the Bash policy and append guidance", async () => {
     const sent: SessionEvent[] = [];
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     let appendedPrompt: string | undefined;
 
     const runner: SessionRunner = (args) => {
@@ -460,14 +425,14 @@ describe("ClaudeSession", () => {
     await session.start({ prompt: "p" });
 
     expect(appendedPrompt).toContain("blob-less git clone");
-    expect(results[0].behavior).toBe("deny");
+    expect(results[0]?.behavior).toBe("deny");
     expect(results[0]).toMatchObject({ behavior: "deny" });
     expect(sent.some((m) => m.type === "notice" && m.text.includes("find"))).toBe(true);
     expect(results[1]).toEqual({
       behavior: "allow",
       updatedInput: { command: "git log --oneline" },
     });
-    expect(results[2].behavior).toBe("allow");
+    expect(results[2]?.behavior).toBe("allow");
     // Only the "ask" command produced a permission card.
     expect(sent.filter((m) => m.type === "permission_request")).toHaveLength(1);
   });
@@ -569,7 +534,7 @@ describe("ClaudeSession", () => {
 
   test("baked workspaces auto-allow read-only Bash with no card or denial", async () => {
     const sent: SessionEvent[] = [];
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     const runner = fakeRunner(async function* (args) {
       // The hook is installed on every workspace and auto-allows read-only
       // commands the CLI doesn't recognize (the reported git ls-tree case).
@@ -611,15 +576,15 @@ describe("ClaudeSession", () => {
       }
     }, runner);
     await session.start({ prompt: "p" });
-    expect(results[0].behavior).toBe("allow");
-    expect(results[1].behavior).toBe("allow");
+    expect(results[0]?.behavior).toBe("allow");
+    expect(results[1]?.behavior).toBe("allow");
     expect(sent.filter((m) => m.type === "permission_request")).toHaveLength(1);
     expect(sent.some((m) => m.type === "notice")).toBe(false);
   });
 
   test("read-only VFS tools are always allowed without a prompt", async () => {
     const sent: SessionEvent[] = [];
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     let runnerArgs: Parameters<SessionRunner>[0] | undefined;
     const runner = fakeRunner(async function* (args) {
       runnerArgs = args;
@@ -630,14 +595,14 @@ describe("ClaudeSession", () => {
     });
 
     const session = new ClaudeSession((msg) => sent.push(msg), runner);
-    await session.start({ prompt: "p", mode: "default" });
+    await session.start({ prompt: "p" });
 
     // Passed to the CLI as allowedTools (no prompt at all)...
     expect(runnerArgs?.allowedTools).toEqual(
       expect.arrayContaining(["Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite"]),
     );
     // ...and short-circuited in canUseTool as a fallback.
-    expect(results.every((r) => r.behavior === "allow")).toBe(true);
+    expect(results.every((r) => r?.behavior === "allow")).toBe(true);
     expect(sent.filter((m) => m.type === "permission_request")).toHaveLength(0);
   });
 

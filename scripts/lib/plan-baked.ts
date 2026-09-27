@@ -5,8 +5,8 @@
  * permission mode works.
  *
  * Unlike planRemoteRepo() there is no blob-less clone and no hydration:
- * every file is already on disk, so only the plan-file VFS
- * (preload/vfs-virtual.ts) is injected to stream plan content over IPC.
+ * every file is already on disk, so no preload is injected. Plan files are
+ * captured through the plansDirectory setting (lib/plan-capture.ts).
  */
 
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
@@ -43,7 +43,7 @@ export function planBakedRepo(options: BakedPlanOptions): BakedPlanSession {
   const session = runSession(options, {
     cwd: options.root,
     env: buildChildEnv(),
-    preloads: ["vfs-virtual.ts"],
+    preloads: [],
   });
 
   return { session, root: options.root, ref: resolveBakedRef(options.root) };

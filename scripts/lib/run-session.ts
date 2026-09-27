@@ -13,7 +13,8 @@ import {
   type Query,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { claudeCliPath, preloadScript } from "./runtime-paths";
+import { planCaptureHooks, plansDirectoryPath, plansDirectorySetting } from "./plan-capture";
+import { claudeExecutablePath, preloadScript } from "./runtime-paths";
 import { makeSpawnWithPreloads, type VfsMessage } from "./spawn-vfs";
 
 /** Options common to every session, whatever the workspace. */
@@ -32,7 +33,7 @@ export interface SessionOptions {
   disallowedTools?: string[];
   /** Called with the plan content whenever a plan file is finalized. */
   onPlan?: (content: string, filename: string) => void;
-  /** Called for every VFS IPC message (hydrate_fetch, vfs_write, plan_file_write, ...). */
+  /** Called for every VFS IPC message (hydrate_init, hydrate_fetch, ...). */
   onVfsMessage?: (msg: VfsMessage) => void;
   /** Permission callback — lets the host answer tool permission requests. */
   canUseTool?: CanUseTool;
@@ -50,17 +51,20 @@ export interface WorkspaceConfig {
   cwd: string;
   /** Child env (before extraEnv is applied). */
   env: Record<string, string | undefined>;
-  /** Preload script basenames under preload/, e.g. "vfs-virtual.ts". */
+  /** Preload script basenames under preload/, e.g. "vfs-hydrate.ts". */
   preloads: string[];
 }
 
 export function runSession(options: SessionOptions, workspace: WorkspaceConfig): Query {
-  const handleMessage = (msg: VfsMessage): void => {
-    if (msg.type === "plan_file_write" && options.onPlan) {
-      options.onPlan(String(msg.content), String(msg.filename));
-    }
-    options.onVfsMessage?.(msg);
-  };
+  const plansDirectory = plansDirectorySetting(workspace.cwd);
+  const hooks = { ...options.hooks };
+  if (options.onPlan) {
+    const planDir = plansDirectoryPath(workspace.cwd, workspace.env);
+    hooks.PostToolUse = [
+      ...(hooks.PostToolUse ?? []),
+      ...planCaptureHooks(planDir, options.onPlan),
+    ];
+  }
 
   return query({
     prompt: options.prompt,
@@ -70,17 +74,17 @@ export function runSession(options: SessionOptions, workspace: WorkspaceConfig):
       systemPrompt: options.appendSystemPrompt
         ? { type: "preset", preset: "claude_code", append: options.appendSystemPrompt }
         : undefined,
-      executable: "bun",
-      pathToClaudeCodeExecutable: claudeCliPath(),
+      pathToClaudeCodeExecutable: claudeExecutablePath(),
       cwd: workspace.cwd,
-      hooks: options.hooks,
+      hooks,
       allowedTools: options.allowedTools,
       disallowedTools: options.disallowedTools,
       canUseTool: options.canUseTool,
       abortController: options.abortController,
+      settings: plansDirectory ? { plansDirectory } : undefined,
       spawnClaudeCodeProcess: makeSpawnWithPreloads(
         workspace.preloads.map((name) => preloadScript(name)),
-        handleMessage,
+        (msg) => options.onVfsMessage?.(msg),
       ),
     },
   });

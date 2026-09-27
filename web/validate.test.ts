@@ -17,11 +17,9 @@ import {
 } from "./lib/validate";
 
 describe("sanitizeStartMessage", () => {
-  test("accepts the supported permission modes", () => {
-    for (const mode of ["plan", "default", "acceptEdits"] as const) {
-      const result = sanitizeStartMessage({ prompt: "p", mode });
-      expect(result.ok && result.value.mode).toBe(mode);
-    }
+  test("accepts plan mode", () => {
+    const result = sanitizeStartMessage({ prompt: "p", mode: "plan" });
+    expect(result.ok && result.value.mode).toBe("plan");
   });
 
   test("defaults the mode to plan", () => {
@@ -29,8 +27,8 @@ describe("sanitizeStartMessage", () => {
     expect(result.ok && result.value.mode).toBe("plan");
   });
 
-  test("rejects bypassPermissions and other unknown modes", () => {
-    for (const mode of ["bypassPermissions", "dontAsk", 42, {}]) {
+  test("rejects every mode but plan", () => {
+    for (const mode of ["bypassPermissions", "dontAsk", "default", "acceptEdits", "auto", 42, {}]) {
       const result = sanitizeStartMessage({ prompt: "p", mode });
       expect(result.ok).toBe(false);
     }
@@ -49,7 +47,6 @@ describe("sanitizeStartMessage", () => {
       branch: " main ",
       localPath: ["/etc"],
       strategy: "rsync",
-      stopOnPlanApproval: "yes",
       appendSystemPrompt: { x: 1 },
       allowedTools: "Bash",
       disallowedTools: ["Write", 3, "", null],
@@ -64,7 +61,6 @@ describe("sanitizeStartMessage", () => {
       localPath: undefined,
       strategy: undefined,
       mode: "plan",
-      stopOnPlanApproval: undefined,
       appendSystemPrompt: undefined,
       allowedTools: undefined,
       disallowedTools: ["Write"],
@@ -78,8 +74,7 @@ describe("sanitizeStartMessage", () => {
       repo: "owner/repo",
       localPath: "~/code/x",
       strategy: "git",
-      mode: "acceptEdits",
-      stopOnPlanApproval: false,
+      mode: "plan",
       allowedTools: ["Bash(bun test:*)"],
       auth: { baseUrl: "https://gw.example.com", authToken: "t" },
     });
@@ -89,8 +84,7 @@ describe("sanitizeStartMessage", () => {
       repo: "owner/repo",
       localPath: "~/code/x",
       strategy: "git",
-      mode: "acceptEdits",
-      stopOnPlanApproval: false,
+      mode: "plan",
       allowedTools: ["Bash(bun test:*)"],
       auth: { baseUrl: "https://gw.example.com", authToken: "t" },
     });

@@ -1,50 +1,53 @@
 # Virtual File System for Claude Code Plan Mode
 
-Two complementary Virtual File Systems (VFS) for Claude Code's Plan Mode, both injected via Bun's `--preload`:
+A hydrating Virtual File System (VFS) for Claude Code's Plan Mode, injected as a Bun preload, plus live plan-file capture:
 
-1. **Virtual plan files** (`preload/vfs-virtual.ts`) — plan files are kept entirely in memory and never touch disk, allowing real-time streaming of plan content via IPC.
-2. **Hydrating repo files** (`preload/vfs-hydrate.ts`) — Claude Code can plan against a repo cloned with `--filter=blob:none --no-checkout` (no file contents downloaded). Files are hydrated on demand via the `gh` CLI the first time Claude reads them, so **a fully cloned repo is never needed**.
+1. **Hydrating repo files** (`preload/vfs-hydrate.ts`) — Claude Code can plan against a repo cloned with `--filter=blob:none --no-checkout` (no file contents downloaded). Files are hydrated on demand via the `gh` CLI the first time Claude reads them, so **a fully cloned repo is never needed**.
+2. **Plan capture** (`scripts/lib/plan-capture.ts`) — sessions point Claude Code's `plansDirectory` setting at the workspace's `.git/cc-planner-plans/`, and an in-process SDK PostToolUse hook streams each plan to the UI as Claude writes it.
 
-On top of this infra, `web/` provides a **general browser client for Claude Code** — multi-turn sessions, browser-side permissions, diffs, plan review — see [Web TTY](#web-tty).
+Every session is a **planning session**: it runs in plan mode and ends when the plan is approved — the approved plan is the deliverable.
+
+On top of this infra, `web/` provides a **browser client for Claude Code planning sessions** — multi-turn sessions, browser-side permissions, diffs, plan review — see [Web TTY](#web-tty).
 
 ## Overview
 
-When Claude Code operates in Plan Mode, it writes plan files to `~/.claude/plans/`. This VFS intercepts all filesystem operations for that directory and virtualizes them completely in memory.
+Claude Code (`@anthropic-ai/claude-agent-sdk` ^0.3) ships as a native, Bun-compiled binary installed from a per-platform optional dependency, `@anthropic-ai/claude-agent-sdk-<platform>-<arch>[-musl]` (see `nativePackageName()` / `claudeExecutablePath()` in `scripts/lib/runtime-paths.ts`). Because it's a Bun executable, it honors the `BUN_OPTIONS` env var — so the VFS preload is injected as `BUN_OPTIONS="--preload <path>"` rather than on the command line.
 
 **Key Features:**
 
-- 📁 **Complete Virtualization** - Plan files never touch disk
-- 🚀 **Real-time Streaming** - Stream plan content via IPC as it's written
 - 🪶 **Blob-less Clones** - Plan against any GitHub repo without downloading its contents
 - 💧 **On-demand Hydration** - Repo files are fetched via `gh api` only when Claude reads them
+- 🚀 **Real-time Plan Streaming** - A PostToolUse hook on plan-file writes streams each plan to the UI as it's written
 - 🔍 **Full Transparency** - All other filesystem paths work normally
-- ⚡ **Zero Overhead** - Uses Bun's `--preload` for early injection
+- ⚡ **Zero Overhead** - Uses a Bun preload (via `BUN_OPTIONS`) for early injection
 
 ## How It Works
 
-Claude Code uses an atomic write pattern when creating plan files:
+### Preload injection
 
-1. Write content to: `~/.claude/plans/plan.md.tmp.{pid}.{timestamp}`
-2. Rename to final: `~/.claude/plans/plan.md`
+`makeSpawnWithPreloads()` (`scripts/lib/spawn-vfs.ts`) is a custom SDK spawn function: it spawns the native binary with `BUN_OPTIONS` set to `--preload <path>` for each preload (via `preloadEnv()`) and an IPC channel for VFS events.
 
-The VFS intercepts both operations:
+- `BUN_OPTIONS` is split on whitespace with no quoting, so a preload path containing whitespace (e.g. inside `My App.app`) is reached through a symlink in the temp directory.
+- Each preload restores the caller's original `BUN_OPTIONS` on load (passed in `CC_VFS_ORIGINAL_BUN_OPTIONS`), so subprocesses Claude runs — Bash commands, hooks — don't inherit the VFS.
 
-- **writeFileSync** - captures content and stores in memory
-- **renameSync** - updates the virtual filename and broadcasts via IPC
-- **readFileSync** - returns content from memory
-- **existsSync** - checks virtual filesystem
-- **statSync** - returns fake stats for virtual files
-- **unlinkSync** - deletes from virtual filesystem
+### Plan files
 
-All paths outside `~/.claude/plans/` pass through to the original `fs` methods.
+Plan files are written by Claude's own Write/Edit tool calls. They default to `~/.claude/plans/` (or `$CLAUDE_CONFIG_DIR/plans`). Git workspaces instead set Claude Code's `plansDirectory` setting to `.git/cc-planner-plans` (`PLANS_SUBDIR` / `plansDirectorySetting()` in `scripts/lib/plan-capture.ts`). The setting must point inside the project root; `.git` keeps plans out of git, and the hydrating VFS ignores `.git`, so the files pass through untouched.
+
+Capture needs no filesystem watching and no fs interception inside the claude process: `planCaptureHooks(plansDir, onPlan)` returns an in-process SDK **PostToolUse** hook on `Write|Edit|MultiEdit`. When the tool's `file_path` is a `.md` file directly inside the plans directory (matched under both its path and its realpath, e.g. `/var/folders` vs `/private/var/folders` on macOS), the hook reads the file and calls `onPlan(content, filename)`. `plansDirectoryPath(cwd, env)` gives that directory: `<cwd>/.git/cc-planner-plans` when the workspace has a `.git` directory, otherwise `$CLAUDE_CONFIG_DIR/plans` or `~/.claude/plans`.
+
+Plans live on disk — inside the workspace's `.git` directory for git workspaces (for lazy sessions that's a throwaway temp clone). Workspaces without a `.git` directory get live plan updates too, from the default plans directory. As a fallback, the final plan also arrives in `ExitPlanMode`'s input, which the web session re-emits as a `plan_update`.
+
+> **Legacy:** `preload/vfs-virtual.ts` kept plan files entirely in memory by intercepting `fs` calls under `~/.claude/plans/`. It targets the JS CLI (`cli.js`, SDK ≤0.2.x); the native CLI writes plan files through `/proc/self/fd/<dirfd>/...` paths the preload can't recognize, so sessions no longer inject it. It and its tests remain in the repo — see [Legacy plan-file VFS](#legacy-plan-file-vfs).
 
 ## Quick Start
 
 ### Prerequisites
 
 - [Bun](https://bun.sh) runtime installed
-- Claude Code CLI installed
-- API key configured in Claude Code
+- API key configured in Claude Code (or an existing `claude` login)
+
+`bun install` installs Claude Code itself: the SDK pulls in the native binary for your platform as an optional dependency.
 
 ### Installation
 
@@ -58,27 +61,35 @@ bun install
 bun test
 ```
 
-The suite covers both VFS layers:
+The suite covers:
 
-1. **Virtual VFS** - Plan files never touch disk; regular files pass through
-2. **Hydrating VFS** - Files in a blob-less clone are fetched on demand (tests run fully offline against a local fixture repo and a fake `gh`)
+1. **Hydrating VFS** - Files in a blob-less clone are fetched on demand (tests run fully offline against a local fixture repo and a fake `gh`)
+2. **Legacy plan-file VFS** - Plan files never touch disk; regular files pass through
+3. **Session plumbing** (`scripts/session-plumbing.test.ts`) - `BUN_OPTIONS` preload injection (including the whitespace symlink and restoring the caller's value), the `plansDirectory` choice, and the plan-capture hook reporting only Write/Edit of plan files in the plans directory.
+4. **Web server** - The session bridge, start-message validation, and the Bash policy
 
 ## Just the Claude Code CLI (no web app)
 
-The VFS layers are plain `bun --preload` scripts — they work with the regular Claude Code CLI too. To start an interactive (or `-p` print-mode) session against any GitHub repo without cloning it:
+The VFS is a plain Bun preload — it works with the regular Claude Code CLI too. To start an interactive (or `-p` print-mode) planning session against any GitHub repo without cloning it:
 
 ```bash
-# Interactive plan-mode session against a repo you never clone
-bun run scripts/claude-vfs.ts owner/repo -- --permission-mode plan
+# Interactive planning session against a repo you never clone
+bun run scripts/claude-vfs.ts owner/repo
 
 # Non-interactive
 bun run scripts/claude-vfs.ts owner/repo -- -p "Summarize the build system"
 
 # Pin a branch, force a hydration strategy
-bun run scripts/claude-vfs.ts owner/repo --branch dev --strategy git -- --permission-mode plan
+bun run scripts/claude-vfs.ts owner/repo --branch dev --strategy git
 ```
 
-The launcher makes a blob-less clone into a temp directory, configures `preload/vfs-hydrate.ts` via the `CC_HYDRATE_*` env vars, and runs the CLI inside that workspace. Everything after `--` is passed to `claude` verbatim. Your existing login and settings (`~/.claude`) apply as usual.
+The launcher (`scripts/claude-vfs.ts`) makes a blob-less clone into a temp directory, configures `preload/vfs-hydrate.ts` via the `CC_HYDRATE_*` env vars and `BUN_OPTIONS`, and runs the native binary inside that workspace with `--permission-mode plan` and a `--settings` JSON containing:
+
+- `plansDirectory` — plan files stay inside the throwaway clone's `.git` dir.
+- A **PreToolUse** hook on Bash → `scripts/bash-policy-hook.ts`, which applies the web app's [Bash policy](#web-tty) (`web/lib/bash-policy.ts`): read-only commands like `git ls-tree` run without prompts and VFS-hostile ones are denied with guidance.
+- A **PostToolUse** hook on ExitPlanMode → `scripts/plan-approved-hook.ts`, which writes the approved plan to `$CC_PLANNER_APPROVED_FILE` and returns `continue: false`. The launcher then stops the CLI and prints the plan.
+
+Everything after `--` is passed to `claude` verbatim, except that sessions are plan-only: `--permission-mode` other than `plan`, `--settings`, and `--dangerously-skip-permissions` are rejected. In `-p` print mode there is no one to approve a plan, so ExitPlanMode isn't available and the plan is the final answer. Your existing login and settings (`~/.claude`) apply as usual.
 
 Doing it by hand (e.g. to wire the preload into your own tooling):
 
@@ -86,19 +97,16 @@ Doing it by hand (e.g. to wire the preload into your own tooling):
 git clone --filter=blob:none --no-checkout https://github.com/owner/repo.git /tmp/ws
 cd /tmp/ws
 CC_HYDRATE_ROOT=/tmp/ws \
-  bun --preload /path/to/cc-planner/preload/vfs-hydrate.ts \
-  /path/to/cc-planner/node_modules/@anthropic-ai/claude-agent-sdk/cli.js \
+  BUN_OPTIONS="--preload /path/to/cc-planner/preload/vfs-hydrate.ts" \
+  /path/to/cc-planner/node_modules/@anthropic-ai/claude-agent-sdk-<platform>-<arch>/claude \
   --permission-mode plan
 ```
 
-Two things to know:
-
-- `--preload` only applies to a JS entrypoint, so this runs the `cli.js` vendored in `@anthropic-ai/claude-agent-sdk` (it _is_ Claude Code) rather than a native-installer `claude` binary.
-- The plain CLI doesn't get the web app's extras (plan streaming UI, Bash hydration policy, prompt-free read-only tools) — it's just Claude Code on a lazily-hydrated workspace. Directory listings, `access` and `realpath` come from the repo manifest. With the `gh` strategy `stat` does too — sizes come from one GitHub trees API call and mtime is the commit time (hydrated files keep it), so a broad Glob downloads nothing; with the `git` strategy sizes can't be known without the blob, so `stat` hydrates. File contents are fetched on first read. See [Configuration](#configuration) for the `CC_HYDRATE_*` knobs.
+The plain CLI doesn't get the web app's extras (plan streaming UI, prompt-free read-only tools) — it's just Claude Code on a lazily-hydrated workspace. Directory listings, `access` and `realpath` come from the repo manifest. With the `gh` strategy `stat` does too — sizes come from one GitHub trees API call and mtime is the commit time (hydrated files keep it), so a broad listing downloads nothing; with the `git` strategy sizes can't be known without the blob, so `stat` hydrates. File contents are fetched on first read. See [Configuration](#configuration) for the `CC_HYDRATE_*` knobs.
 
 ## Web TTY
 
-`web/` is a general browser client for Claude Code — a TTY with niceties. It's decoupled from the planner: sessions are multi-turn, run in any permission mode, and every interactive tool call is handled in the browser. The cc-planner VFS infra provides its repo workspaces.
+`web/` is a browser client for Claude Code planning sessions — a TTY with niceties. Sessions are multi-turn, always run in plan mode, end when the plan is approved, and every interactive tool call is handled in the browser. The cc-planner VFS infra provides its repo workspaces.
 
 ```bash
 bun run build          # build the UI (Vite)
@@ -108,23 +116,23 @@ bun run start          # serve http://localhost:3000 (PORT to override)
 bun run start & bun run dev:ui
 ```
 
-The server binds `127.0.0.1` by default — it runs claude sessions with the host's credentials and filesystem, so exposing it on the network is an explicit opt-in via `CC_WEB_HOST=0.0.0.0` (the Dockerfile sets this; put an authenticating proxy in front of anything reachable by others). WebSocket upgrades from a browser page on a different origin are rejected (403); add trusted origins with `CC_WEB_ALLOWED_ORIGINS`. Start messages are validated server-side: the permission mode must be `plan`, `default`, or `acceptEdits` (never `bypassPermissions`), and malformed tool lists or options are dropped.
+The server binds `127.0.0.1` by default — it runs claude sessions with the host's credentials and filesystem, so exposing it on the network is an explicit opt-in via `CC_WEB_HOST=0.0.0.0` (the Dockerfile sets this; put an authenticating proxy in front of anything reachable by others). WebSocket upgrades from a browser page on a different origin are rejected (403); add trusted origins with `CC_WEB_ALLOWED_ORIGINS`. Start messages are validated server-side (`web/lib/validate.ts`): the permission mode must be `plan` (`SESSION_MODES`) — anything else is rejected — and malformed tool lists or options are dropped.
 
 **Features**
 
 - **Multi-turn sessions** — the first prompt starts the session; a composer sends follow-up messages (queued if a turn is running), `Stop turn` interrupts the current turn, and `End session` closes input so Claude finishes and exits. Multiple concurrent sessions multiplex over one WebSocket, each in its own claude process.
-- **Permission modes** — start a session in `plan`, `default`, or `acceptEdits`. Outside plan mode, every gated tool call (Bash, Edit, Write, ...) renders as an allow / always-allow / deny card in the browser via the SDK's `canUseTool` callback.
+- **Browser permissions** — every gated tool call (Bash, Edit, Write, ...) renders as an allow / always-allow / deny card in the browser via the SDK's `canUseTool` callback.
 - **Diff viewer** — Edit/Write tool activity and their permission cards render Shiki-highlighted unified diffs with [@pierre/diffs](https://diffs.com), so changes can be reviewed before they're allowed. Write diffs are computed against the current file on disk.
 - **AskUserQuestion in the browser** — question cards (header chips, 2-4 options with descriptions, multi-select, free-text "Other") render inline in the session feed.
-- **Plan mode + review** — the plan panel renders the plan markdown live as Claude writes it (via the plan-file VFS IPC events). When Claude calls `ExitPlanMode`, a review bar appears: approve or request changes with feedback. "End session when plan is approved" (on by default in plan mode) preserves the classic planner workflow; turn it off and approval lets Claude continue into implementation under browser-prompted permissions.
+- **Plan mode + review** — the plan panel renders the plan markdown live as Claude writes it (via the plan-capture PostToolUse hook). When Claude calls `ExitPlanMode`, a review bar appears: approve or request changes with feedback. Approving ends the session — the approved plan is the deliverable.
 - **Session stats** — duration (ticking live), token usage by type and per model, turn count, and hydration volume. Cost is always **estimated from public Claude API token pricing** (`web/lib/pricing.ts`) and marked `~`/`(est.)`; the SDK's own cost figure is never displayed.
 - **localStorage persistence** — prompts, repo metadata, status, stats, and the latest plan of every session persist in the browser (live transcripts are not persisted across reloads).
 - **Settings in the UI** — the sidebar settings (persisted in localStorage, sent with each new session) cover what would otherwise be server env vars, which matters for the desktop app: an Anthropic API key (`ANTHROPIC_API_KEY`), an LLM gateway base URL + bearer token (`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`), and the hydration strategy for lazy sessions (`gh` / `git` / auto). Leave auth empty to use the server's environment — e.g. an existing `claude` login on the desktop.
 - **Local folder workspaces** — the start form's workspace picker accepts an absolute path (`~` ok) to a checkout on the server's machine instead of a GitHub repo: no clone, no hydration, sessions run directly against the folder. On the desktop app the server _is_ the user's machine, making this the natural mode for working on local repos.
 - **PWA** — installable, with a web manifest and an auto-updating service worker (app shell precached, hashed assets cached on demand).
-- **Prompt-free read-only tools** — `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`, and `TodoWrite` never require a permission prompt in any permission mode: they're answered by the VFS layer (manifest-backed listings, on-demand reads) and passed to the CLI as `allowedTools`, with a `canUseTool` short-circuit as fallback.
+- **Prompt-free read-only tools** — `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`, and `TodoWrite` never require a permission prompt: they're passed to the CLI as `allowedTools`, with a `canUseTool` short-circuit as fallback. On lazy workspaces Read hydrates on demand and listings come from the manifest (Glob and Grep see only hydrated files — see [Limitations](#limitations)).
 - **Per-session tool & prompt configuration** — the start form's _Advanced_ section takes extra always-allowed tools (including `Bash(...)` patterns like `Bash(bun test:*)`), disallowed tools (removed from the session entirely), and extra system-prompt instructions. Custom instructions are appended to the Claude Code preset system prompt (the SDK supports append only — there is no prepend) and compose with the hydration guidance on lazy workspaces.
-- **Hydration-aware Bash policy** — on lazy workspaces, shell commands that fight the VFS are blocked with guidance: `tree`/`find`/`ls -R`/`du` (the tree is served from the manifest — Glob/LS see it for free), `cat`/`head`/`tail`/direct `grep` on files (subprocesses only see already-hydrated files — Read hydrates on demand), recursive `grep`/`rg` and `git grep` (which promisor-fetches every blob it searches). Read-only git metadata commands and pipeline filters (`git log | head`) are auto-allowed. Enforced by a PreToolUse hook (so it catches commands plan mode would auto-allow) plus matching guidance appended to the system prompt, which in practice steers Claude to Glob/Read before any command is attempted (`web/lib/bash-policy.ts`).
+- **Bash policy** — a deterministic policy (`web/lib/bash-policy.ts`) with two layers. Read-only commands (including read-only git metadata commands) are auto-allowed on every workspace. On lazy workspaces, commands that fight the VFS — tree walks, bulk file readers, recursive searches, and git commands that would promisor-fetch blobs for every commit or file they touch — are denied with guidance (subprocesses only see already-hydrated files; Read hydrates on demand). Anything not provably safe falls through to a normal permission prompt, and git `-c` / `--config-env` / `--exec-path` always prompt. Enforced by a PreToolUse hook (so it catches commands plan mode would auto-allow) plus matching guidance appended to the system prompt, which in practice steers Claude to LS/Read before any command is attempted.
 
 The frontend is TypeScript Web Components built with Vite (`web/src/`), typed against the shared WebSocket protocol (`web/lib/protocol.ts`).
 
@@ -166,8 +174,8 @@ bun run app:build    # production build → build/stable-macos-*/
 
 How the bundle stays self-contained (`electrobun.config.ts` + `desktop/index.ts`):
 
-- The Vite UI build, the `preload/` VFS scripts, and the Claude Agent SDK package (its `cli.js` is what sessions spawn) are copied into `Resources/app/`; `desktop/index.ts` points the session runners at them via `CC_RESOURCES_ROOT` (see `scripts/lib/runtime-paths.ts`). ASAR stays off because preload scripts and `cli.js` must be real files for `bun --preload` and child spawning.
-- The bundled Bun runtime (`Contents/MacOS/bun`) is prepended to `PATH`, so spawned sessions don't need a system bun install. Homebrew dirs are appended too, since GUI apps launch with a minimal `PATH` and lazy hydration needs `git`/`gh`.
+- The Vite UI build, the `preload/` VFS scripts, and the native Claude Code binary package for the build machine's platform (`@anthropic-ai/claude-agent-sdk-<platform>-<arch>`, which is what sessions spawn) are copied into `Resources/app/` — the binary lands at `Resources/app/claude-native/claude`. `desktop/index.ts` points the session runners at them via `CC_RESOURCES_ROOT` (see `scripts/lib/runtime-paths.ts`). ASAR stays off because the preload scripts and the binary must be real files for `BUN_OPTIONS=--preload` and child spawning. Preload paths inside `My App.app`-style bundles with spaces are handled by the tmpdir symlink described in [Preload injection](#preload-injection).
+- The bundled Bun runtime (`Contents/MacOS/bun`) is prepended to `PATH`, so spawned hooks and scripts don't need a system bun install. Homebrew dirs are added too, since GUI apps launch with a minimal `PATH` and lazy hydration needs `git`/`gh`.
 - App icons come from `icon.iconset/`, generated alongside the PWA icons by `bun run scripts/generate-icons.ts` and converted by `iconutil` during the build.
 
 No env vars are needed to configure the app: auth (API key or gateway), the hydration strategy, and local-folder workspaces are all set in the UI (see [the settings and workspace features](#web-tty)). Sessions fall back to the server environment for auth, so an existing `claude` login on the machine just works.
@@ -184,6 +192,7 @@ browser (Vite + TS Web Components)  ←WebSocket→  web/lib/server.ts (Bun.serv
   cc-diff (@pierre/diffs) / cc-stats-panel           ├─ canUseTool → question / plan review / permission cards
   cc-session-list / cc-settings-panel                ├─ planRemoteRepo() — lazy hydration workspace
                                                      └─ planBakedRepo()  — baked workspace
+                                                        (both via runSession(): scripts/lib/run-session.ts)
 ```
 
 Every session-scoped WebSocket message carries a client-generated `sessionId` (`web/lib/protocol.ts`), which is how one socket multiplexes many sessions.
@@ -192,76 +201,62 @@ Every session-scoped WebSocket message carries a client-generated `sessionId` (`
 
 All `CC_`-prefixed env vars in one place:
 
-| Variable                 | Read by                        | Default                          | Description                                                                                                                                                                                             |
-| ------------------------ | ------------------------------ | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CC_BAKED_REPO_PATH`     | `web/lib/server.ts`            | unset                            | Path to a fully checked-out repo. If the directory exists, the web app runs in **baked** mode and plans against it; otherwise it runs in **lazy hydration** mode. The Dockerfile sets this to `/repo`.  |
-| `CC_BAKED_REPO`          | `web/lib/server.ts`            | unset                            | `owner/repo` label for the baked checkout, shown in the UI and session records. Set from the `BAKE_REPO` build arg by the Dockerfile.                                                                   |
-| `CC_HYDRATE_ROOT`        | `preload/vfs-hydrate.ts`       | unset (preload is inert)         | Path of the blob-less working tree to hydrate into.                                                                                                                                                     |
-| `CC_HYDRATE_REPO`        | `preload/vfs-hydrate.ts`       | parsed from the `origin` remote  | `owner/repo` used for `gh api` content fetches.                                                                                                                                                         |
-| `CC_HYDRATE_REF`         | `preload/vfs-hydrate.ts`       | `HEAD`'s sha                     | Commit to hydrate file contents from.                                                                                                                                                                   |
-| `CC_HYDRATE_STRATEGY`    | `preload/vfs-hydrate.ts`       | `gh`                             | How contents are fetched: `gh` (GitHub contents API) or `git` (promisor lazy fetch). See [Hydration Strategies](#hydration-strategies).                                                                 |
-| `CC_RESOURCES_ROOT`      | `scripts/lib/runtime-paths.ts` | unset (resolve from source tree) | Directory containing copies of `preload/` and the agent SDK (`claude-agent-sdk/cli.js`). Set by the packaged desktop app (`desktop/index.ts`), where import.meta-relative paths don't survive bundling. |
-| `CC_WEB_HOST`            | `web/server.ts`                | `127.0.0.1`                      | Interface the web server binds. Set to `0.0.0.0` to accept non-local connections; the Dockerfile does this so `-p 3000:3000` works.                                                                     |
-| `CC_WEB_ALLOWED_ORIGINS` | `web/server.ts`                | unset (same-origin only)         | Comma-separated extra browser origins (`https://host:port`) allowed to open the `/ws` WebSocket. Requests without an `Origin` header (non-browser clients) are always allowed.                          |
+| Variable                      | Read by                         | Default                          | Description                                                                                                                                                                                                          |
+| ----------------------------- | ------------------------------- | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CC_BAKED_REPO_PATH`          | `web/lib/server.ts`             | unset                            | Path to a fully checked-out repo. If the directory exists, the web app runs in **baked** mode and plans against it; otherwise it runs in **lazy hydration** mode. The Dockerfile sets this to `/repo`.               |
+| `CC_BAKED_REPO`               | `web/lib/server.ts`             | unset                            | `owner/repo` label for the baked checkout, shown in the UI and session records. Set from the `BAKE_REPO` build arg by the Dockerfile.                                                                                |
+| `CC_HYDRATE_ROOT`             | `preload/vfs-hydrate.ts`        | unset (preload is inert)         | Path of the blob-less working tree to hydrate into.                                                                                                                                                                  |
+| `CC_HYDRATE_REPO`             | `preload/vfs-hydrate.ts`        | parsed from the `origin` remote  | `owner/repo` used for `gh api` content fetches.                                                                                                                                                                      |
+| `CC_HYDRATE_REF`              | `preload/vfs-hydrate.ts`        | `HEAD`'s sha                     | Commit to hydrate file contents from.                                                                                                                                                                                |
+| `CC_HYDRATE_STRATEGY`         | `preload/vfs-hydrate.ts`        | `gh`                             | How contents are fetched: `gh` (GitHub contents API) or `git` (promisor lazy fetch). See [Hydration Strategies](#hydration-strategies).                                                                              |
+| `CC_VFS_ORIGINAL_BUN_OPTIONS` | `preload/*.ts`                  | unset                            | The caller's original `BUN_OPTIONS`, set by `preloadEnv()` (`scripts/lib/spawn-vfs.ts`). Each preload restores it on load so subprocesses Claude runs don't inherit the VFS.                                         |
+| `CC_PLANNER_APPROVED_FILE`    | `scripts/plan-approved-hook.ts` | unset                            | File the ExitPlanMode PostToolUse hook writes the approved plan to. Set by `scripts/claude-vfs.ts`, which watches for it to end the session.                                                                         |
+| `CC_RESOURCES_ROOT`           | `scripts/lib/runtime-paths.ts`  | unset (resolve from source tree) | Directory containing copies of `preload/` and the native Claude Code binary (`claude-native/claude`). Set by the packaged desktop app (`desktop/index.ts`), where import.meta-relative paths don't survive bundling. |
+| `CC_WEB_HOST`                 | `web/server.ts`                 | `127.0.0.1`                      | Interface the web server binds. Set to `0.0.0.0` to accept non-local connections; the Dockerfile does this so `-p 3000:3000` works.                                                                                  |
+| `CC_WEB_ALLOWED_ORIGINS`      | `web/server.ts`                 | unset (same-origin only)         | Comma-separated extra browser origins (`https://host:port`) allowed to open the `/ws` WebSocket. Requests without an `Origin` header (non-browser clients) are always allowed.                                       |
 
-The `CC_HYDRATE_*` vars are set automatically by `planRemoteRepo()` for the child claude process — you only set them yourself when wiring up `preload/vfs-hydrate.ts` manually (see [Configuration](#configuration)). The `CC_BAKED_*` vars configure the web server's repo mode and are normally set by the Dockerfile; `CC_WEB_*` configure its network exposure.
+The `CC_HYDRATE_*` vars are set automatically by `planRemoteRepo()` for the child claude process — you only set them yourself when wiring up `preload/vfs-hydrate.ts` manually (see [Configuration](#configuration)). `CC_VFS_ORIGINAL_BUN_OPTIONS` and `CC_PLANNER_APPROVED_FILE` are internal plumbing. The `CC_BAKED_*` vars configure the web server's repo mode and are normally set by the Dockerfile; `CC_WEB_*` configure its network exposure.
 
 ## Usage Example
 
-Use the VFS with the Claude Agent SDK by providing a custom spawn function:
+Use the VFS with the Claude Agent SDK by pointing it at the native binary and providing a spawn function that injects the preload through `BUN_OPTIONS` (this is what `runSession()` in `scripts/lib/run-session.ts` does):
 
 ```typescript
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { spawn } from "child_process";
-import path from "path";
+import {
+  planCaptureHooks,
+  plansDirectoryPath,
+  plansDirectorySetting,
+} from "./scripts/lib/plan-capture";
+import { claudeExecutablePath, preloadScript } from "./scripts/lib/runtime-paths";
+import { makeSpawnWithPreloads } from "./scripts/lib/spawn-vfs";
 
-const VFS_SCRIPT = path.join(__dirname, "preload", "vfs-virtual.ts");
+const cwd = "/tmp/ws"; // a blob-less clone (see "Doing it by hand" above)
 
 // CRITICAL: Unset CLAUDECODE to allow nested sessions
 delete process.env.CLAUDECODE;
+
+// Called with each plan file as Claude writes it into <cwd>/.git/cc-planner-plans
+const onPlan = (content: string, filename: string) => {
+  console.log(`Plan updated: ${filename}`);
+  // Stream to UI via WebSocket, SSE, etc.
+};
+const plansDirectory = plansDirectorySetting(cwd);
 
 const session = query({
   prompt: "Create a plan for building a REST API",
   options: {
     permissionMode: "plan",
-    executable: "bun",
-    cwd: "/path/to/codebase",
+    cwd,
+    env: { ...process.env, CC_HYDRATE_ROOT: cwd },
+    pathToClaudeCodeExecutable: claudeExecutablePath(),
+    settings: plansDirectory ? { plansDirectory } : undefined,
+    hooks: { PostToolUse: planCaptureHooks(plansDirectoryPath(cwd), onPlan) },
 
-    // Custom spawn to inject VFS preload
-    spawnClaudeCodeProcess: (options) => {
-      const argsWithPreload = ["--preload", VFS_SCRIPT, ...options.args];
-
-      const proc = spawn(options.command, argsWithPreload, {
-        cwd: options.cwd,
-        env: options.env,
-        stdio: ["pipe", "pipe", "pipe", "ipc"],
-        signal: options.signal,
-      });
-
-      // Listen for VFS events via IPC
-      proc.on("message", (msg: any) => {
-        if (msg.type === "vfs_init") {
-          console.log(`VFS initialized: ${msg.plansDir}`);
-        }
-        if (msg.type === "plan_file_write") {
-          // Real-time plan content streaming!
-          console.log(`Plan updated: ${msg.filename}`);
-          console.log(`Content: ${msg.content}`);
-          // Stream to UI via WebSocket, SSE, etc.
-        }
-      });
-
-      return {
-        stdin: proc.stdin,
-        stdout: proc.stdout,
-        killed: proc.killed,
-        exitCode: proc.exitCode,
-        kill: proc.kill.bind(proc),
-        on: proc.on.bind(proc),
-        once: proc.once.bind(proc),
-        off: proc.off.bind(proc),
-      };
-    },
+    // Spawn the native binary with BUN_OPTIONS="--preload .../vfs-hydrate.ts"
+    spawnClaudeCodeProcess: makeSpawnWithPreloads([preloadScript("vfs-hydrate.ts")], (msg) => {
+      if (msg.type === "hydrate_fetch") console.log(`Hydrated ${msg.rel}`);
+    }),
   },
 });
 
@@ -302,8 +297,8 @@ bun run scripts/plan-remote-repo.ts owner/repo "Create a plan for adding rate li
 The blob-less clone is an internal implementation detail — you never interact with it directly:
 
 1. `planRemoteRepo()` clones the repo into a temp directory with `git clone --filter=blob:none --no-checkout`. This downloads commits and trees but **zero file contents**, and leaves the working tree empty. For a large repo this is a few hundred KB instead of hundreds of MB.
-2. The child claude process is started with `preload/vfs-hydrate.ts`, which builds a manifest of every file in the tree from `git ls-tree` (purely local — trees are always present in a blob-less clone).
-3. Directory listings (`readdir`), existence checks (`existsSync`), and path stats are answered from the manifest with **no network access**, so Claude sees the full repo structure immediately.
+2. The child claude process is started with `preload/vfs-hydrate.ts` in `BUN_OPTIONS`; the preload builds a manifest of every file in the tree from `git ls-tree` (purely local — trees are always present in a blob-less clone).
+3. Directory listings (`readdir`), existence checks (`existsSync`), and path stats are answered from the manifest with **no network access**, so Claude sees the full repo structure immediately. Paths are matched under both the root and its real path (on macOS the temp dir `/var/folders/...` is realpathed to `/private/var/folders/...`).
 4. The first time Claude actually reads a file (`readFileSync`, `fs.promises.readFile`, `open`, ...), the preload fetches it with `gh api repos/<owner>/<repo>/contents/<path>?ref=<sha>` (raw media type), writes it to disk, and the read proceeds normally.
 5. Hydrated files live on disk, so subsequent access — including from subprocesses like `rg` or `cat` spawned by Bash tools — works without interception. Files Claude writes or deletes behave like a normal filesystem.
 
@@ -329,7 +324,8 @@ Two fetch strategies are supported; `planRemoteRepo()` picks automatically:
 
 ### Limitations
 
-- Content searches that spawn subprocesses (ripgrep, grep) only see files that have already been hydrated. Plan-mode exploration driven by Read/Glob/LS works fully.
+- Claude Code's Glob and Grep tools shell out to ripgrep, which runs outside the preload and only sees files that have already been hydrated. Explore directory structure with LS/Read and `git ls-files` / `git ls-tree` instead.
+- Other content searches that spawn subprocesses (grep, rg from Bash) likewise only see hydrated files. Plan-mode exploration driven by LS/Read works fully.
 - Symlinks and submodules in the tree are not hydrated.
 - Hydration is synchronous (blocking `gh` call) per first read of each file.
 
@@ -354,7 +350,7 @@ Before spawning a child claude process, you need to:
    - `CLAUDECODE`
    - `CLAUDE_CODE_REMOTE`
 
-The example at `scripts/sdk-example.ts` demonstrates this with a `buildChildEnv()` helper that conditionally applies these fixups only when running inside a sandbox, so the same code works on both a regular desktop and inside `claude.ai/code`:
+The example at `scripts/sdk-example.ts` demonstrates this with a `buildChildEnv()` helper (`scripts/lib/child-env.ts`) that conditionally applies these fixups only when running inside a sandbox, so the same code works on both a regular desktop and inside `claude.ai/code`:
 
 ```bash
 bun run scripts/sdk-example.ts
@@ -370,77 +366,7 @@ bun run scripts/plan-remote-repo.ts owner/repo "Create a plan for ..."
 
 ## IPC Events
 
-The VFS communicates via IPC messages:
-
-### `vfs_init`
-
-Sent when VFS initializes.
-
-```typescript
-{
-  type: "vfs_init",
-  plansDir: "/Users/you/.claude/plans",
-  mode: "virtual",
-  timestamp: 1234567890
-}
-```
-
-### `vfs_write`
-
-Sent when content is written (including temp files).
-
-```typescript
-{
-  type: "vfs_write",
-  path: "/Users/you/.claude/plans/plan.md.tmp.123.456",
-  filename: "plan.md.tmp.123.456",
-  content: "# Plan Content",
-  size: 123,
-  timestamp: 1234567890
-}
-```
-
-### `plan_file_write`
-
-Sent when a plan file is finalized (after rename).
-
-```typescript
-{
-  type: "plan_file_write",
-  path: "/Users/you/.claude/plans/plan.md",
-  filename: "plan.md",
-  content: "# Plan Content",
-  size: 123,
-  timestamp: 1234567890
-}
-```
-
-### `vfs_read`
-
-Sent when a virtual file is read.
-
-```typescript
-{
-  type: "vfs_read",
-  path: "/Users/you/.claude/plans/plan.md",
-  filename: "plan.md",
-  size: 123,
-  timestamp: 1234567890
-}
-```
-
-### `vfs_unlink`
-
-Sent when a virtual file is deleted.
-
-```typescript
-{
-  type: "vfs_unlink",
-  path: "/Users/you/.claude/plans/plan.md",
-  filename: "plan.md",
-  timestamp: 1234567890
-}
-```
+The hydrating VFS communicates with the host via IPC messages (delivered to the `onMessage` handler of `makeSpawnWithPreloads()` / `onVfsMessage` of `runSession()`). Plan content is not an IPC event any more — it comes from the plan-capture PostToolUse hook (`onPlan`).
 
 ### `hydrate_init`
 
@@ -486,6 +412,10 @@ Sent when a `gh api` fetch fails (the read then throws `EIO`).
 }
 ```
 
+### Legacy plan-file VFS events
+
+The legacy `preload/vfs-virtual.ts` (JS CLI only; not injected by sessions) emits `vfs_init` (with `plansDir`), `vfs_write` (every write, including `.tmp` files), `plan_file_write` (a plan file finalized by rename, with `filename` and `content`), `vfs_read`, and `vfs_unlink`.
+
 ## Project Structure
 
 ```
@@ -500,20 +430,27 @@ cc-planner/
 ├── desktop/
 │   └── index.ts                # macOS app entry: embeds the server, opens a window
 ├── preload/
-│   ├── vfs-virtual.ts          # In-memory VFS for plan files
-│   └── vfs-hydrate.ts          # On-demand hydration over blob-less clones
+│   ├── vfs-hydrate.ts          # On-demand hydration over blob-less clones
+│   └── vfs-virtual.ts          # Legacy: in-memory plan-file VFS (JS CLI only, unused)
 ├── scripts/
+│   ├── claude-vfs.ts           # Plain Claude Code CLI on a lazily-hydrated workspace
+│   ├── bash-policy-hook.ts     # PreToolUse Bash hook for the launcher (bash policy)
+│   ├── plan-approved-hook.ts   # PostToolUse ExitPlanMode hook: ends the session
 │   ├── sdk-example.ts          # Runnable SDK example (sandbox-safe)
 │   ├── plan-remote-repo.ts     # Plan against a repo without cloning it
 │   ├── generate-icons.ts       # Regenerates the PWA + macOS icons (no image deps)
 │   ├── lib/
 │   │   ├── plan-remote.ts      # planRemoteRepo() — lazy-hydration sessions
 │   │   ├── plan-baked.ts       # planBakedRepo() — baked-checkout sessions
+│   │   ├── run-session.ts      # runSession(): shared SDK query setup for both
+│   │   ├── plan-capture.ts     # plansDirectory setting + plan-capture hook
 │   │   ├── blobless-clone.ts   # Internal: blob-less clone helper
 │   │   ├── child-env.ts        # Internal: sandbox auth env fixups
-│   │   ├── runtime-paths.ts    # Internal: preload/CLI paths (packaged override)
-│   │   └── spawn-vfs.ts        # Internal: SDK spawn fn with preloads
-│   ├── vfs-virtual.test.ts     # Bun test suite (plan-file VFS)
+│   │   ├── runtime-paths.ts    # Internal: preload/native binary paths (packaged override)
+│   │   └── spawn-vfs.ts        # Internal: SDK spawn fn with BUN_OPTIONS preloads
+│   ├── child-env.test.ts       # Bun test suite (sandbox env fixups)
+│   ├── session-plumbing.test.ts # Bun test suite (preload env, plan capture)
+│   ├── vfs-virtual.test.ts     # Bun test suite (legacy plan-file VFS)
 │   └── vfs-hydrate.test.ts     # Bun test suite (hydrating VFS, offline)
 └── web/
     ├── server.ts               # Standalone CLI entry for the server
@@ -521,9 +458,13 @@ cc-planner/
     ├── lib/
     │   ├── server.ts           # Bun HTTP + WebSocket server (embeddable)
     │   ├── protocol.ts         # Browser <-> server message types
+    │   ├── validate.ts         # Validation of untrusted browser messages
+    │   ├── bash-policy.ts      # Bash command policy + hydration guidance
     │   ├── pricing.ts          # Public token pricing for cost estimates
     │   └── session.ts          # ClaudeSession: SDK <-> browser bridge
     ├── session.test.ts         # Bun test suite (session bridge, offline)
+    ├── validate.test.ts        # Bun test suite (message validation, server)
+    ├── bash-policy.test.ts     # Bun test suite (Bash policy)
     ├── public/                 # Static assets (PWA icons)
     └── src/                    # TypeScript Web Components (Vite)
         ├── main.ts             # Entry: styles, components, SW registration
@@ -537,78 +478,27 @@ cc-planner/
 
 ## Implementation Details
 
-### Virtual Filesystem
+### Plan capture
 
-The VFS maintains an in-memory `Map<string, string>` for all plan files:
-
-```typescript
-const virtualFiles = new Map<string, string>();
-
-function isVirtualPath(filePath: string): boolean {
-  const normalized = path.resolve(filePath);
-  return normalized.startsWith(PLANS_DIR);
-}
-
-fs.writeFileSync = function (filePath, data, options) {
-  if (isVirtualPath(filePath)) {
-    const content = typeof data === "string" ? data : data?.toString("utf-8");
-    virtualFiles.set(path.resolve(filePath), content);
-    process.send({ type: "vfs_write", content, ... });
-    return; // Don't touch disk!
-  }
-  return orig.writeFileSync.call(this, filePath, data, options);
-};
-```
-
-### Atomic Writes
-
-Claude Code's atomic write pattern ensures consistency:
-
-1. **Write temp file**: Content is stored in virtual filesystem
-2. **Rename to final**: Map key is updated, final event is broadcast
+`planCaptureHooks()` reports only writes of `.md` files directly inside the plans directory, comparing against both spellings of the directory (path and realpath):
 
 ```typescript
-const tempFileContents = new Map<string, string>();
-
-// Capture temp file writes
-fs.writeFileSync = function (filePath, data, options) {
-  if (isVirtualPath(filePath) && filePath.includes(".md.tmp.")) {
-    tempFileContents.set(filePath, content);
-  }
-  // ... store in virtualFiles
+const hook: HookCallback = async (input) => {
+  if (input.hook_event_name !== "PostToolUse") return {};
+  const filePath = (input.tool_input as { file_path?: unknown } | undefined)?.file_path;
+  if (typeof filePath !== "string" || !filePath.endsWith(".md")) return {};
+  if (!dirs.includes(path.dirname(path.resolve(filePath)))) return {};
+  onPlan(readFileSync(filePath, "utf-8"), path.basename(filePath));
+  return {};
 };
-
-// Finalize on rename
-fs.renameSync = function (oldPath, newPath) {
-  if (isVirtualPath(newPath)) {
-    const content = virtualFiles.get(oldPath);
-    virtualFiles.delete(oldPath);
-    virtualFiles.set(newPath, content);
-    process.send({ type: "plan_file_write", content, ... });
-  }
-};
+return [{ matcher: "Write|Edit|MultiEdit", hooks: [hook] }];
 ```
 
-### Fake Stats
+`runSession()` appends these matchers to any caller-supplied PostToolUse hooks when `onPlan` is set. If the file can't be read right after the write, the hook reports nothing — `ExitPlanMode` still carries the plan.
 
-The VFS returns realistic `fs.Stats` objects for virtual files:
+### Legacy plan-file VFS
 
-```typescript
-fs.statSync = function (filePath, options) {
-  if (isVirtualPath(filePath)) {
-    const content = virtualFiles.get(path.resolve(filePath));
-    if (!content) throw ENOENT;
-
-    return {
-      size: content.length,
-      isFile: () => true,
-      isDirectory: () => false,
-      // ... other stat properties
-    };
-  }
-  return orig.statSync.call(this, filePath, options);
-};
-```
+`preload/vfs-virtual.ts` maintains an in-memory `Map<string, string>` for all files under `~/.claude/plans/`, intercepting `writeFileSync`, `renameSync`, `readFileSync`, `existsSync`, `statSync`, and `unlinkSync` (returning fake `fs.Stats` for virtual files) and passing every other path through. This works against the JS CLI (SDK ≤0.2.x), where plan paths reach `fs` as plain absolute paths. The native CLI writes plan files through `/proc/self/fd/<dirfd>/...` paths the preload can't recognize, which is why sessions switched to `plansDirectory` + the [plan-capture hook](#plan-capture).
 
 ## Testing
 
@@ -620,9 +510,10 @@ bun test
 
 The tests verify:
 
-1. **Virtual VFS** - Plan files in `~/.claude/plans/` are completely virtualized and never touch disk
-2. **Passthrough** - Regular files outside `~/.claude/plans/` work normally and are written to disk
-3. **Hydrating VFS** - Blob-less clones list their full tree without network access, hydrate file contents on first read (exactly one `gh` call per file), preserve executable bits, tombstone deletions, and compose with the plan-file VFS. These tests run fully offline against a local fixture repo and a fake `gh` binary.
+1. **Hydrating VFS** - Blob-less clones list their full tree without network access, hydrate file contents on first read (exactly one `gh` call per file), preserve executable bits, and tombstone deletions. These tests run fully offline against a local fixture repo and a fake `gh` binary.
+2. **Legacy plan-file VFS** - Plan files in `~/.claude/plans/` are virtualized and never touch disk; regular files pass through.
+3. **Session plumbing** (`scripts/session-plumbing.test.ts`) - `BUN_OPTIONS` preload injection (including the whitespace symlink and restoring the caller's value), the `plansDirectory` choice, and the plan-capture hook reporting only Write/Edit of plan files in the plans directory.
+4. **Web server** - The session bridge (`web/session.test.ts`), start/session message validation and origin checks (`web/validate.test.ts`), and the Bash policy (`web/bash-policy.test.ts`).
 
 ## Use Cases
 
@@ -631,46 +522,43 @@ The tests verify:
 Stream plan content to a web UI as Claude writes it:
 
 ```typescript
-proc.on("message", (msg) => {
-  if (msg.type === "plan_file_write") {
-    webSocket.send(
-      JSON.stringify({
-        type: "plan_update",
-        content: msg.content,
-      }),
-    );
-  }
+const { session } = planRemoteRepo({
+  repo: "owner/repo",
+  prompt: "Create a plan for ...",
+  onPlan: (content, filename) => {
+    webSocket.send(JSON.stringify({ type: "plan_update", filename, content }));
+  },
 });
 ```
 
 ### Plan Analytics
 
-Track plan evolution over time without disk I/O:
+Track plan evolution over time:
 
 ```typescript
 const planHistory: string[] = [];
 
-proc.on("message", (msg) => {
-  if (msg.type === "vfs_write") {
-    planHistory.push(msg.content);
-  }
+const { session } = planRemoteRepo({
+  repo: "owner/repo",
+  prompt: "Create a plan for ...",
+  onPlan: (content) => planHistory.push(content),
 });
 ```
 
 ### Multi-session Plans
 
-Keep multiple planning sessions isolated in memory:
+Keep multiple planning sessions isolated — each session's plans live in its own workspace's `.git/cc-planner-plans`, and each session's plan-capture hook (and so its `onPlan` callback) is scoped to that session:
 
 ```typescript
 const sessions = new Map<string, Map<string, string>>();
 
-proc.on("message", (msg) => {
-  if (msg.type === "plan_file_write") {
+function onPlanFor(sessionId: string) {
+  return (content: string, filename: string) => {
     const sessionPlans = sessions.get(sessionId) || new Map();
-    sessionPlans.set(msg.filename, msg.content);
+    sessionPlans.set(filename, content);
     sessions.set(sessionId, sessionPlans);
-  }
-});
+  };
+}
 ```
 
 ## License

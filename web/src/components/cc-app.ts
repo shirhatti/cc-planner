@@ -155,7 +155,6 @@ export class CcApp extends HTMLElement {
       repo: "",
       branch: "",
       mode: "plan",
-      stopOnPlanApproval: true,
       plan: "",
       planFilename: "",
       createdAt: Date.now(),
@@ -179,8 +178,7 @@ export class CcApp extends HTMLElement {
         (this.config.mode === "baked" ? (this.config.repo ?? "") : ""),
       branch: detail.branch,
       prompt: detail.prompt,
-      mode: detail.mode,
-      stopOnPlanApproval: detail.stopOnPlanApproval,
+      mode: "plan",
       status: "starting" as const,
       createdAt: Date.now(),
       startedAt: Date.now(),
@@ -202,8 +200,7 @@ export class CcApp extends HTMLElement {
       localPath: detail.localPath || undefined,
       strategy:
         settings.strategy === "gh" || settings.strategy === "git" ? settings.strategy : undefined,
-      mode: detail.mode,
-      stopOnPlanApproval: detail.stopOnPlanApproval,
+      mode: "plan",
       appendSystemPrompt: detail.appendSystemPrompt || undefined,
       allowedTools: detail.allowedTools.length ? detail.allowedTools : undefined,
       disallowedTools: detail.disallowedTools.length ? detail.disallowedTools : undefined,
@@ -309,10 +306,7 @@ export class CcApp extends HTMLElement {
         feed.addInfo(
           msg.approved ? "Plan approved ✔" : "Changes requested — Claude is revising the plan",
         );
-        this.updateStatus(
-          msg.sessionId,
-          msg.approved && record.stopOnPlanApproval ? "approved" : "running",
-        );
+        this.updateStatus(msg.sessionId, msg.approved ? "approved" : "running");
         break;
       case "notice":
         feed.addInfo(msg.text);

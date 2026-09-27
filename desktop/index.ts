@@ -10,10 +10,12 @@
  * its runtime resources copied next to it by electrobun.config.ts:
  *
  *   Resources/app/web-dist/          the Vite UI build
- *   Resources/app/preload/           VFS preload scripts (spawned via
- *                                    `bun --preload`, so they must be
- *                                    real files — keep ASAR off)
- *   Resources/app/claude-agent-sdk/  SDK package incl. cli.js + ripgrep
+ *   Resources/app/preload/           VFS preload scripts (loaded via
+ *                                    BUN_OPTIONS=--preload, so they must
+ *                                    be real files — keep ASAR off)
+ *   Resources/app/claude-native/     the native claude binary for this
+ *                                    platform (from the SDK's per-platform
+ *                                    optional dependency)
  *   Contents/MacOS/bun               the bundled Bun runtime
  */
 

@@ -11,8 +11,8 @@
 import type { AuthConfig, ClientMessage, HydrateStrategy, SessionMode } from "./protocol";
 import type { StartRequest } from "./session";
 
-/** Permission modes a browser may request. bypassPermissions is never allowed. */
-export const SESSION_MODES: readonly SessionMode[] = ["plan", "default", "acceptEdits"];
+/** Permission modes a browser may request: sessions are plan-only. */
+export const SESSION_MODES: readonly SessionMode[] = ["plan"];
 
 const HYDRATE_STRATEGIES: readonly HydrateStrategy[] = ["gh", "git"];
 
@@ -103,8 +103,6 @@ export function sanitizeStartMessage(raw: Record<string, unknown>): SanitizeResu
           ? (raw.strategy as HydrateStrategy)
           : undefined,
       mode,
-      stopOnPlanApproval:
-        typeof raw.stopOnPlanApproval === "boolean" ? raw.stopOnPlanApproval : undefined,
       appendSystemPrompt: optionalString(raw.appendSystemPrompt)?.slice(0, MAX_PROMPT_CHARS),
       allowedTools: sanitizeStringList(raw.allowedTools),
       disallowedTools: sanitizeStringList(raw.disallowedTools),

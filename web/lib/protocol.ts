@@ -7,8 +7,11 @@
  * client-generated `sessionId`.
  */
 
-/** Permission modes the browser can start a session in. */
-export type SessionMode = "plan" | "default" | "acceptEdits";
+/**
+ * Sessions always run in plan mode and end when the plan is approved — the
+ * approved plan is the deliverable.
+ */
+export type SessionMode = "plan";
 
 /** A single question from Claude Code's AskUserQuestion tool. */
 export interface UserQuestion {
@@ -97,15 +100,8 @@ export type ClientMessage =
       localPath?: string;
       /** Lazy mode: override how file contents are hydrated. */
       strategy?: HydrateStrategy;
-      /** Permission mode. Defaults to "plan". */
+      /** Permission mode — always "plan". */
       mode?: SessionMode;
-      /**
-       * Plan mode only: end the session once the plan is approved (the
-       * classic planner workflow). When false, approval lets Claude continue
-       * into implementation, with tool permissions prompted in the browser.
-       * Defaults to true in plan mode.
-       */
-      stopOnPlanApproval?: boolean;
       /**
        * Extra instructions appended to the Claude Code system prompt (the SDK
        * supports append-to-preset only; there is no prepend).

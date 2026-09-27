@@ -7,7 +7,7 @@
  * - a blob-less, checkout-less clone (commit/tree metadata only) into a
  *   temp directory
  * - on-demand file hydration via `gh api` (preload/vfs-hydrate.ts)
- * - in-memory plan files streamed over IPC (preload/vfs-virtual.ts)
+ * - plan files captured from the workspace's .git dir (lib/plan-capture.ts)
  * - child env fixups for running inside a Claude Code sandbox
  */
 
@@ -52,7 +52,7 @@ export function planRemoteRepo(options: RemotePlanOptions): RemotePlanSession {
   const session = runSession(options, {
     cwd: root,
     env: { ...buildChildEnv(), ...hydrateEnv(clone, strategy) },
-    preloads: ["vfs-virtual.ts", "vfs-hydrate.ts"],
+    preloads: ["vfs-hydrate.ts"],
   });
 
   return { session, root, ref: clone.ref };

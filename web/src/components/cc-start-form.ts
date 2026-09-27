@@ -1,13 +1,12 @@
 /**
  * <cc-start-form> — for a draft session: workspace source (GitHub repo,
  * local folder on the server's machine, or the server's baked default),
- * prompt input, the permission-mode picker, and the planner
- * stop-on-approval toggle. For a started session: a read-only summary.
+ * and prompt input. Sessions always run in plan mode and end when the plan
+ * is approved. For a started session: a read-only summary.
  *
- * Emits "start-session" with { repo, branch, localPath, prompt, mode, ... }.
+ * Emits "start-session" with { repo, branch, localPath, prompt, ... }.
  */
 
-import type { SessionMode } from "../../lib/protocol";
 import type { SessionRecord } from "../store";
 
 export interface StartSessionDetail {
@@ -16,18 +15,10 @@ export interface StartSessionDetail {
   /** Absolute path (~ ok) of a checkout on the server's filesystem. */
   localPath: string;
   prompt: string;
-  mode: SessionMode;
-  stopOnPlanApproval: boolean;
   appendSystemPrompt: string;
   allowedTools: string[];
   disallowedTools: string[];
 }
-
-const MODE_OPTIONS: { value: SessionMode; label: string }[] = [
-  { value: "plan", label: "Plan mode" },
-  { value: "default", label: "Default (ask permissions)" },
-  { value: "acceptEdits", label: "Accept edits" },
-];
 
 export class CcStartForm extends HTMLElement {
   private workspaceMode: "baked" | "lazy" = "lazy";
@@ -68,15 +59,6 @@ export class CcStartForm extends HTMLElement {
           <input class="local-path" type="text"
             placeholder="/absolute/path/to/checkout or ~/code/repo" spellcheck="false" />
         </div>
-        <div class="row">
-          <select class="mode">
-            ${MODE_OPTIONS.map((m) => `<option value="${m.value}">${m.label}</option>`).join("")}
-          </select>
-          <label class="stop-on-approval">
-            <input type="checkbox" class="stop" checked />
-            <span>End session when plan is approved</span>
-          </label>
-        </div>
         <textarea class="prompt" rows="3"
           placeholder="What should Claude do? This starts the session — you can keep chatting after."></textarea>
         <details class="advanced">
@@ -108,15 +90,8 @@ export class CcStartForm extends HTMLElement {
       const repoInput = form.querySelector<HTMLInputElement>(".repo")!;
       const localInput = form.querySelector<HTMLInputElement>(".local-path")!;
       const promptInput = form.querySelector<HTMLTextAreaElement>(".prompt")!;
-      const modeSelect = form.querySelector<HTMLSelectElement>(".mode")!;
-      const stopLabel = form.querySelector<HTMLElement>(".stop-on-approval")!;
-      const stopCheckbox = form.querySelector<HTMLInputElement>(".stop")!;
       repoInput.value = record.repo ?? "";
       promptInput.value = record.prompt ?? "";
-      modeSelect.value = record.mode ?? "plan";
-      modeSelect.onchange = () => {
-        stopLabel.hidden = modeSelect.value !== "plan";
-      };
       sourceSelect.value = baked ? "baked" : "repo";
       sourceSelect.onchange = () => {
         repoRow.hidden = sourceSelect.value !== "repo";
@@ -159,8 +134,6 @@ export class CcStartForm extends HTMLElement {
                   : "",
               localPath,
               prompt,
-              mode: modeSelect.value as SessionMode,
-              stopOnPlanApproval: stopCheckbox.checked,
               appendSystemPrompt: form
                 .querySelector<HTMLTextAreaElement>(".append-prompt")!
                 .value.trim(),
@@ -182,9 +155,7 @@ export class CcStartForm extends HTMLElement {
     const meta = document.createElement("div");
     meta.className = "summary-meta muted";
     meta.textContent =
-      record.repo +
-      (record.ref ? ` @ ${record.ref.slice(0, 8)}` : "") +
-      ` · ${record.mode ?? "plan"} mode`;
+      record.repo + (record.ref ? ` @ ${record.ref.slice(0, 8)}` : "") + " · plan mode";
     summary.append(prompt, meta);
     this.append(summary);
   }

@@ -46,7 +46,6 @@ export interface SessionRecord {
   repo: string;
   branch: string;
   mode: SessionMode;
-  stopOnPlanApproval: boolean;
   plan: string;
   planFilename: string;
   createdAt: number;

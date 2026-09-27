@@ -19,6 +19,15 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { fileURLToPath } = require("node:url");
 
+// Injected via BUN_OPTIONS (scripts/lib/spawn-vfs.ts): restore the caller's
+// own BUN_OPTIONS so subprocesses claude runs don't inherit the VFS preloads.
+if (process.env.CC_VFS_ORIGINAL_BUN_OPTIONS !== undefined) {
+  const original = process.env.CC_VFS_ORIGINAL_BUN_OPTIONS;
+  if (original) process.env.BUN_OPTIONS = original;
+  else delete process.env.BUN_OPTIONS;
+  delete process.env.CC_VFS_ORIGINAL_BUN_OPTIONS;
+}
+
 import type {
   PathLike,
   PathOrFileDescriptor,

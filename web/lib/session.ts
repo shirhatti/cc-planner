@@ -10,9 +10,8 @@
  * - canUseTool routes every gated tool call to the browser: AskUserQuestion
  *   renders as question cards, ExitPlanMode as a plan review, and everything
  *   else (Bash, Edit, Write, ...) as allow/deny permission cards.
- * - In the classic planner workflow (stopOnPlanApproval), approving the plan
- *   ends the session — the plan is the deliverable. Otherwise approval lets
- *   Claude continue into implementation under browser-prompted permissions.
+ * - Sessions always run in plan mode, and approving the plan ends the
+ *   session — the approved plan is the deliverable.
  */
 
 import { existsSync, readFileSync } from "fs";
@@ -143,7 +142,7 @@ export interface RunnerArgs {
 }
 
 export interface RunnerResult {
-  session: AsyncIterable<SDKMessage> & { interrupt?: () => Promise<void> };
+  session: AsyncIterable<SDKMessage> & { interrupt?: () => Promise<unknown> };
   repo: string;
   ref: string;
 }
@@ -298,7 +297,6 @@ export interface StartRequest {
   localPath?: string;
   strategy?: HydrateStrategy;
   mode?: SessionMode;
-  stopOnPlanApproval?: boolean;
   appendSystemPrompt?: string;
   allowedTools?: string[];
   disallowedTools?: string[];
@@ -336,7 +334,8 @@ export class ClaudeSession {
   private session?: RunnerResult["session"];
   private started = false;
   private planApproved = false;
-  private stopOnPlanApproval = true;
+  /** Filename of the last plan file reported, so the review keeps its name. */
+  private planFilename = "plan.md";
   private startedAt = 0;
   /**
    * Usage per API call, keyed by message id. The SDK can emit several
@@ -364,8 +363,7 @@ export class ClaudeSession {
     this.started = true;
     this.startedAt = Date.now();
 
-    const mode: SessionMode = req.mode ?? "plan";
-    this.stopOnPlanApproval = mode === "plan" && (req.stopOnPlanApproval ?? true);
+    const mode: SessionMode = "plan";
     this.input.push(req.prompt);
 
     // Compose the system-prompt append: hydration guidance (when the
@@ -401,7 +399,10 @@ export class ClaudeSession {
         extraEnv: gatewayEnv(req.auth),
         canUseTool: this.canUseTool,
         abortController: this.abort,
-        onPlan: (content, filename) => this.send({ type: "plan_update", filename, content }),
+        onPlan: (content, filename) => {
+          this.planFilename = filename;
+          this.send({ type: "plan_update", filename, content });
+        },
         onVfsMessage: (msg) => this.handleVfsMessage(msg),
       });
       this.session = session;
@@ -532,14 +533,14 @@ export class ClaudeSession {
       const allowedPrompts = (input.allowedPrompts ?? []) as { tool: string; prompt: string }[];
       // The CLI injects the plan-file content into the tool input. Re-emit it
       // as a plan_update so the review always has a preview — the plan file
-      // itself may have been written through an API the plan-file VFS doesn't
-      // intercept (e.g. fs.promises), or never written at all.
+      // may live outside the watched plans dir (workspaces without .git), or
+      // never have been written at all.
       const plan = typeof input.plan === "string" ? input.plan : "";
       if (plan.trim()) {
         const filename =
           typeof input.filePath === "string" && input.filePath
             ? path.basename(input.filePath)
-            : "plan.md";
+            : this.planFilename;
         this.send({ type: "plan_update", filename, content: plan });
       }
       const reply = await this.waitForClient(
@@ -552,12 +553,10 @@ export class ClaudeSession {
       this.send({ type: "plan_decided", approved });
 
       if (approved) {
-        if (this.stopOnPlanApproval) {
-          // Planner workflow: the approved plan is the deliverable. Allow the
-          // tool call to resolve, then stop before implementation.
-          this.planApproved = true;
-          setTimeout(() => this.stopSession(), 0);
-        }
+        // The approved plan is the deliverable: allow the tool call to
+        // resolve, then stop before implementation.
+        this.planApproved = true;
+        setTimeout(() => this.stopSession(), 0);
         return { behavior: "allow", updatedInput: input };
       }
       return { behavior: "deny", message: decision?.feedback?.trim() || REJECTION_FALLBACK };
