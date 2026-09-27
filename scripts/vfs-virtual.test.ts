@@ -2,7 +2,8 @@ import { test, expect } from "bun:test";
 import { spawn } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
-import { existsSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "fs";
+import os from "os";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.join(__dirname, "..");
@@ -43,11 +44,13 @@ async function runWithVfs(script: string): Promise<TestResult> {
 }
 
 test("virtual VFS - plan files never touch disk", async () => {
+  // Ensure the real plans dir exists so the "nothing new on disk" check is meaningful
+  mkdirSync(PLANS_DIR, { recursive: true });
+
   // Track files that existed before test
   const filesBefore = new Set<string>();
   try {
-    const existing = await Bun.readdir(PLANS_DIR);
-    existing.forEach((f) => filesBefore.add(f));
+    readdirSync(PLANS_DIR).forEach((f) => filesBefore.add(f));
   } catch {
     // Plans directory doesn't exist yet
   }
@@ -104,7 +107,7 @@ console.log("All operations complete!");
   // Check if any new files were created on disk
   let filesAfter: string[];
   try {
-    filesAfter = await Bun.readdir(PLANS_DIR);
+    filesAfter = readdirSync(PLANS_DIR);
   } catch {
     filesAfter = [];
   }
@@ -112,7 +115,9 @@ console.log("All operations complete!");
   const newFiles = filesAfter.filter((f) => !filesBefore.has(f));
 
   // Assert: No files should have been written to disk
-  expect(newFiles.length).toBe(0);
+  expect(newFiles).toEqual([]);
+  expect(existsSync(path.join(PLANS_DIR, "virtual-test.md"))).toBe(false);
+  expect(existsSync(path.join(PLANS_DIR, "virtual-test.md.tmp.99999"))).toBe(false);
 
   // Assert: We should have received VFS events
   expect(events.length).toBeGreaterThan(0);
@@ -351,4 +356,196 @@ test("virtual VFS - existsSync works for virtual paths", async () => {
   expect(exitCode).toBe(0);
   expect(stdout).toContain("before:false");
   expect(stdout).toContain("after:true");
+});
+
+test("virtual VFS - non-ASCII content reports byte size and round-trips exactly", async () => {
+  const text = "héllo ✓ 日本";
+  const bytes = Buffer.byteLength(text, "utf-8");
+  const { exitCode, stdout, stderr, events } = await runWithVfs(`
+    const fs = require('fs');
+    const path = require('path');
+    const f = path.join(${JSON.stringify(PLANS_DIR)}, "utf8-test.md");
+    const text = ${JSON.stringify(text)};
+    fs.writeFileSync(f, text);
+    console.log("size:" + fs.statSync(f).size);
+    const buf = fs.readFileSync(f);
+    console.log("bufLen:" + buf.length);
+    console.log("bufEq:" + buf.equals(Buffer.from(text, "utf-8")));
+    console.log("utf8Eq:" + (fs.readFileSync(f, "utf-8") === text));
+    console.log("b64Eq:" + (fs.readFileSync(f, { encoding: "base64" }) === Buffer.from(text).toString("base64")));
+    buf[0] = 0; // mutating the returned buffer must not affect the stored file
+    console.log("unmutated:" + (fs.readFileSync(f, "utf8") === text));
+    fs.writeFileSync(f, Buffer.from(text).toString("base64"), { encoding: "base64" });
+    console.log("b64WriteEq:" + (fs.readFileSync(f, "utf8") === text));
+  `);
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain(`size:${bytes}`);
+  expect(stdout).toContain(`bufLen:${bytes}`);
+  expect(stdout).toContain("bufEq:true");
+  expect(stdout).toContain("utf8Eq:true");
+  expect(stdout).toContain("b64Eq:true");
+  expect(stdout).toContain("unmutated:true");
+  expect(stdout).toContain("b64WriteEq:true");
+  const write = events.find((e) => e.type === "vfs_write");
+  expect(write?.content).toBe(text);
+  expect(write?.size).toBe(bytes);
+});
+
+test("virtual VFS - sibling dirs with plans prefix and the plans dir itself hit disk", async () => {
+  const sibling = PLANS_DIR + `-vfstest-${process.pid}`;
+  const siblingFile = path.join(sibling, "x.md");
+  try {
+    const { exitCode, stdout, stderr, events } = await runWithVfs(`
+      const fs = require('fs');
+      fs.mkdirSync(${JSON.stringify(sibling)}, { recursive: true });
+      fs.writeFileSync(${JSON.stringify(siblingFile)}, "on disk");
+      fs.mkdirSync(${JSON.stringify(PLANS_DIR)}, { recursive: true });
+      console.log("dirExists:" + fs.existsSync(${JSON.stringify(PLANS_DIR)}));
+      console.log("dirIsDir:" + fs.statSync(${JSON.stringify(PLANS_DIR)}).isDirectory());
+    `);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("dirExists:true");
+    expect(stdout).toContain("dirIsDir:true");
+    expect(readFileSync(siblingFile, "utf-8")).toBe("on disk");
+    expect(events.filter((e) => e.type === "vfs_write")).toEqual([]);
+  } finally {
+    rmSync(sibling, { recursive: true, force: true });
+  }
+});
+
+test("virtual VFS - renameSync handles empty plans, missing sources and virtual->disk", async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), "vfs-virtual-"));
+  const diskTarget = path.join(tmpDir, "exported.md");
+  try {
+    const { exitCode, stdout, stderr, events } = await runWithVfs(`
+      const fs = require('fs');
+      const path = require('path');
+      const dir = ${JSON.stringify(PLANS_DIR)};
+      const tmp = path.join(dir, "empty.md.tmp.1");
+      const final_ = path.join(dir, "empty.md");
+      fs.writeFileSync(tmp, "");
+      fs.renameSync(tmp, final_);
+      console.log("emptyExists:" + fs.existsSync(final_));
+      console.log("emptyContent:[" + fs.readFileSync(final_, "utf-8") + "]");
+      console.log("tmpExists:" + fs.existsSync(tmp));
+      try {
+        fs.renameSync(path.join(dir, "nope.md.tmp.2"), final_);
+        console.log("ERROR: should have thrown");
+      } catch (err) {
+        console.log("code:" + err.code + " syscall:" + err.syscall);
+      }
+      const src = path.join(dir, "export.md");
+      fs.writeFileSync(src, "exported ✓");
+      fs.renameSync(src, ${JSON.stringify(diskTarget)});
+      console.log("srcExists:" + fs.existsSync(src));
+    `);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("emptyExists:true");
+    expect(stdout).toContain("emptyContent:[]");
+    expect(stdout).toContain("tmpExists:false");
+    expect(stdout).toContain("code:ENOENT syscall:rename");
+    expect(stdout).toContain("srcExists:false");
+    expect(readFileSync(diskTarget, "utf-8")).toBe("exported ✓");
+    const planWrite = events.find((e) => e.type === "plan_file_write");
+    expect(planWrite?.filename).toBe("empty.md");
+    expect(planWrite?.content).toBe("");
+    expect(planWrite?.size).toBe(0);
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("virtual VFS - fs.promises is intercepted with the same semantics", async () => {
+  const { exitCode, stdout, stderr, events } = await runWithVfs(`
+    const fsp = require('fs/promises');
+    const path = require('path');
+    const dir = ${JSON.stringify(PLANS_DIR)};
+    const tmp = path.join(dir, "promise.md.tmp.1.2");
+    const final_ = path.join(dir, "promise.md");
+    (async () => {
+      await fsp.writeFile(tmp, "promised ✓");
+      await fsp.rename(tmp, final_);
+      console.log("content:" + (await fsp.readFile(final_, "utf-8")));
+      console.log("isBuffer:" + Buffer.isBuffer(await fsp.readFile(final_)));
+      console.log("size:" + (await fsp.stat(final_)).size);
+      console.log("lstatFile:" + (await fsp.lstat(final_)).isFile());
+      await fsp.access(final_);
+      console.log("access:ok");
+      await fsp.unlink(final_);
+      for (const [name, fn] of [
+        ["readFile", () => fsp.readFile(final_)],
+        ["stat", () => fsp.stat(final_)],
+        ["access", () => fsp.access(final_)],
+        ["unlink", () => fsp.unlink(final_)],
+        ["rename", () => fsp.rename(final_, tmp)],
+      ]) {
+        try {
+          await fn();
+          console.log(name + ":ERROR");
+        } catch (err) {
+          console.log(name + ":" + err.code + ":" + err.syscall);
+        }
+      }
+    })();
+  `);
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain("content:promised ✓");
+  expect(stdout).toContain("isBuffer:true");
+  expect(stdout).toContain(`size:${Buffer.byteLength("promised ✓")}`);
+  expect(stdout).toContain("lstatFile:true");
+  expect(stdout).toContain("access:ok");
+  expect(stdout).toContain("readFile:ENOENT:open");
+  expect(stdout).toContain("stat:ENOENT:stat");
+  expect(stdout).toContain("access:ENOENT:access");
+  expect(stdout).toContain("unlink:ENOENT:unlink");
+  expect(stdout).toContain("rename:ENOENT:rename");
+  expect(events.find((e) => e.type === "vfs_write")?.filename).toBe("promise.md.tmp.1.2");
+  const planWrite = events.find((e) => e.type === "plan_file_write");
+  expect(planWrite?.filename).toBe("promise.md");
+  expect(planWrite?.content).toBe("promised ✓");
+  expect(events.find((e) => e.type === "vfs_unlink")).toBeDefined();
+  expect(existsSync(path.join(PLANS_DIR, "promise.md"))).toBe(false);
+});
+
+test("virtual VFS - statSync/lstatSync honor throwIfNoEntry and callback APIs work", async () => {
+  const { exitCode, stdout, stderr, events } = await runWithVfs(`
+    const fs = require('fs');
+    const path = require('path');
+    const dir = ${JSON.stringify(PLANS_DIR)};
+    const missing = path.join(dir, "missing.md");
+    console.log("stat:" + fs.statSync(missing, { throwIfNoEntry: false }));
+    console.log("lstat:" + fs.lstatSync(missing, { throwIfNoEntry: false }));
+    const tmp = path.join(dir, "cb.md.tmp.1");
+    const final_ = path.join(dir, "cb.md");
+    fs.writeFileSync(tmp, "callback");
+    console.log("lstatSize:" + fs.lstatSync(tmp).size);
+    fs.rename(tmp, final_, (err) => {
+      console.log("renameErr:" + err);
+      fs.stat(final_, (err, st) => {
+        console.log("cbStat:" + st.size);
+        fs.access(final_, fs.constants.R_OK, (err) => {
+          console.log("accessErr:" + err);
+          fs.unlink(final_, (err) => {
+            console.log("unlinkErr:" + err);
+            fs.stat(final_, (err) => console.log("statAfter:" + err.code));
+          });
+        });
+      });
+    });
+  `);
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain("stat:undefined");
+  expect(stdout).toContain("lstat:undefined");
+  expect(stdout).toContain("lstatSize:8");
+  expect(stdout).toContain("renameErr:null");
+  expect(stdout).toContain("cbStat:8");
+  expect(stdout).toContain("accessErr:null");
+  expect(stdout).toContain("unlinkErr:null");
+  expect(stdout).toContain("statAfter:ENOENT");
+  expect(events.find((e) => e.type === "plan_file_write")?.filename).toBe("cb.md");
 });
