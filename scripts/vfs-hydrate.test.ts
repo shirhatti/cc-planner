@@ -20,8 +20,6 @@ import { parseGitHubRepo, encodeApiPath } from "../preload/vfs-hydrate";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.join(__dirname, "..");
 const HYDRATE_SCRIPT = path.join(PROJECT_ROOT, "preload", "vfs-hydrate.ts");
-const VIRTUAL_SCRIPT = path.join(PROJECT_ROOT, "preload", "vfs-virtual.ts");
-const PLANS_DIR = path.join(process.env.HOME!, ".claude", "plans");
 
 // ---------------------------------------------------------------------------
 // Fixture: a local "upstream" repo, a fake `gh` that serves its files, and
@@ -157,17 +155,12 @@ interface TestResult {
   events: Record<string, unknown>[];
 }
 
-function runHydrated(
-  script: string,
-  fixture: Fixture,
-  preloads: string[] = [HYDRATE_SCRIPT],
-): Promise<TestResult> {
+function runHydrated(script: string, fixture: Fixture): Promise<TestResult> {
   const events: Record<string, unknown>[] = [];
   let stdout = "";
   let stderr = "";
 
-  const preloadArgs = preloads.flatMap((p) => ["--preload", p]);
-  const proc = spawn("bun", [...preloadArgs, "-e", script], {
+  const proc = spawn("bun", ["--preload", HYDRATE_SCRIPT, "-e", script], {
     stdio: ["inherit", "pipe", "pipe", "ipc"],
     env: fixture.env,
   });
@@ -723,38 +716,4 @@ test("hydrating VFS - git strategy fetches blobs from the promisor remote withou
   const init = events.find((e) => e.type === "hydrate_init");
   expect(init?.strategy).toBe("git");
   expect(events.find((e) => e.type === "hydrate_fetch")?.rel).toBe("src/index.ts");
-});
-
-test("hydrating VFS - composes with the plan-file VFS preload", async () => {
-  const fixture = freshClone();
-  const planFile = path.join(PLANS_DIR, "hydrate-compose-test.md");
-
-  const { exitCode, stdout, events } = await runHydrated(
-    `
-    const fs = require('fs');
-    const path = require('path');
-    // Read a repo file through the hydrating VFS
-    const repoFile = path.join(${JSON.stringify(fixture.root)}, "README.md");
-    console.log("repo:" + fs.readFileSync(repoFile, "utf-8").trim());
-    // Write a plan file through the virtual VFS
-    fs.writeFileSync(${JSON.stringify(planFile)}, "# Plan from blob-less repo");
-    console.log("plan:" + fs.readFileSync(${JSON.stringify(planFile)}, "utf-8"));
-  `,
-    fixture,
-    [VIRTUAL_SCRIPT, HYDRATE_SCRIPT],
-  );
-
-  expect(exitCode).toBe(0);
-  expect(stdout).toContain("repo:# Widgets");
-  expect(stdout).toContain("plan:# Plan from blob-less repo");
-
-  // Both preloads announced themselves and did their jobs
-  expect(events.find((e) => e.type === "vfs_init")).toBeDefined();
-  expect(events.find((e) => e.type === "hydrate_init")).toBeDefined();
-  expect(events.find((e) => e.type === "hydrate_fetch")).toBeDefined();
-  expect(events.find((e) => e.type === "vfs_write")).toBeDefined();
-
-  // The plan file never touched disk; the repo file did
-  expect(existsSync(planFile)).toBe(false);
-  expect(existsSync(path.join(fixture.root, "README.md"))).toBe(true);
 });

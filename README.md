@@ -38,8 +38,6 @@ Capture needs no filesystem watching and no fs interception inside the claude pr
 
 Plans live on disk — inside the workspace's `.git` directory for git workspaces (for lazy sessions that's a throwaway temp clone). Workspaces without a `.git` directory get live plan updates too, from the default plans directory. As a fallback, the final plan also arrives in `ExitPlanMode`'s input, which the web session re-emits as a `plan_update`.
 
-> **Legacy:** `preload/vfs-virtual.ts` kept plan files entirely in memory by intercepting `fs` calls under `~/.claude/plans/`. It targets the JS CLI (`cli.js`, SDK ≤0.2.x); the native CLI writes plan files through `/proc/self/fd/<dirfd>/...` paths the preload can't recognize, so sessions no longer inject it. It and its tests remain in the repo — see [Legacy plan-file VFS](#legacy-plan-file-vfs).
-
 ## Quick Start
 
 ### Prerequisites
@@ -64,9 +62,8 @@ bun test
 The suite covers:
 
 1. **Hydrating VFS** - Files in a blob-less clone are fetched on demand (tests run fully offline against a local fixture repo and a fake `gh`)
-2. **Legacy plan-file VFS** - Plan files never touch disk; regular files pass through
-3. **Session plumbing** (`scripts/session-plumbing.test.ts`) - `BUN_OPTIONS` preload injection (including the whitespace symlink and restoring the caller's value), the `plansDirectory` choice, and the plan-capture hook reporting only Write/Edit of plan files in the plans directory.
-4. **Web server** - The session bridge, start-message validation, and the Bash policy
+2. **Session plumbing** (`scripts/session-plumbing.test.ts`) - `BUN_OPTIONS` preload injection (including the whitespace symlink and restoring the caller's value), the `plansDirectory` choice, and the plan-capture hook reporting only Write/Edit of plan files in the plans directory.
+3. **Web server** - The session bridge, start-message validation, and the Bash policy
 
 ## Just the Claude Code CLI (no web app)
 
@@ -412,10 +409,6 @@ Sent when a `gh api` fetch fails (the read then throws `EIO`).
 }
 ```
 
-### Legacy plan-file VFS events
-
-The legacy `preload/vfs-virtual.ts` (JS CLI only; not injected by sessions) emits `vfs_init` (with `plansDir`), `vfs_write` (every write, including `.tmp` files), `plan_file_write` (a plan file finalized by rename, with `filename` and `content`), `vfs_read`, and `vfs_unlink`.
-
 ## Project Structure
 
 ```
@@ -431,7 +424,6 @@ cc-planner/
 │   └── index.ts                # macOS app entry: embeds the server, opens a window
 ├── preload/
 │   ├── vfs-hydrate.ts          # On-demand hydration over blob-less clones
-│   └── vfs-virtual.ts          # Legacy: in-memory plan-file VFS (JS CLI only, unused)
 ├── scripts/
 │   ├── claude-vfs.ts           # Plain Claude Code CLI on a lazily-hydrated workspace
 │   ├── bash-policy-hook.ts     # PreToolUse Bash hook for the launcher (bash policy)
@@ -450,7 +442,6 @@ cc-planner/
 │   │   └── spawn-vfs.ts        # Internal: SDK spawn fn with BUN_OPTIONS preloads
 │   ├── child-env.test.ts       # Bun test suite (sandbox env fixups)
 │   ├── session-plumbing.test.ts # Bun test suite (preload env, plan capture)
-│   ├── vfs-virtual.test.ts     # Bun test suite (legacy plan-file VFS)
 │   └── vfs-hydrate.test.ts     # Bun test suite (hydrating VFS, offline)
 └── web/
     ├── server.ts               # Standalone CLI entry for the server
@@ -496,10 +487,6 @@ return [{ matcher: "Write|Edit|MultiEdit", hooks: [hook] }];
 
 `runSession()` appends these matchers to any caller-supplied PostToolUse hooks when `onPlan` is set. If the file can't be read right after the write, the hook reports nothing — `ExitPlanMode` still carries the plan.
 
-### Legacy plan-file VFS
-
-`preload/vfs-virtual.ts` maintains an in-memory `Map<string, string>` for all files under `~/.claude/plans/`, intercepting `writeFileSync`, `renameSync`, `readFileSync`, `existsSync`, `statSync`, and `unlinkSync` (returning fake `fs.Stats` for virtual files) and passing every other path through. This works against the JS CLI (SDK ≤0.2.x), where plan paths reach `fs` as plain absolute paths. The native CLI writes plan files through `/proc/self/fd/<dirfd>/...` paths the preload can't recognize, which is why sessions switched to `plansDirectory` + the [plan-capture hook](#plan-capture).
-
 ## Testing
 
 Run the test suite with:
@@ -511,9 +498,8 @@ bun test
 The tests verify:
 
 1. **Hydrating VFS** - Blob-less clones list their full tree without network access, hydrate file contents on first read (exactly one `gh` call per file), preserve executable bits, and tombstone deletions. These tests run fully offline against a local fixture repo and a fake `gh` binary.
-2. **Legacy plan-file VFS** - Plan files in `~/.claude/plans/` are virtualized and never touch disk; regular files pass through.
-3. **Session plumbing** (`scripts/session-plumbing.test.ts`) - `BUN_OPTIONS` preload injection (including the whitespace symlink and restoring the caller's value), the `plansDirectory` choice, and the plan-capture hook reporting only Write/Edit of plan files in the plans directory.
-4. **Web server** - The session bridge (`web/session.test.ts`), start/session message validation and origin checks (`web/validate.test.ts`), and the Bash policy (`web/bash-policy.test.ts`).
+2. **Session plumbing** (`scripts/session-plumbing.test.ts`) - `BUN_OPTIONS` preload injection (including the whitespace symlink and restoring the caller's value), the `plansDirectory` choice, and the plan-capture hook reporting only Write/Edit of plan files in the plans directory.
+3. **Web server** - The session bridge (`web/session.test.ts`), start/session message validation and origin checks (`web/validate.test.ts`), and the Bash policy (`web/bash-policy.test.ts`).
 
 ## Use Cases
 
