@@ -39,7 +39,7 @@ Claude Code (`@anthropic-ai/claude-agent-sdk` ^0.3) ships as a native, Bun-compi
 
 Plan files are written by Claude's own Write/Edit tool calls. They default to `~/.claude/plans/` (or `$CLAUDE_CONFIG_DIR/plans`). Git workspaces instead set Claude Code's `plansDirectory` setting to `.git/cc-planner-plans` (`PLANS_SUBDIR` / `plansDirectorySetting()` in `scripts/lib/plan-capture.ts`). The setting must point inside the project root; `.git` keeps plans out of git, and the hydrating VFS ignores `.git`, so the files pass through untouched.
 
-Capture needs no filesystem watching and no fs interception inside the claude process: `planCaptureHooks(plansDir, onPlan)` returns an in-process SDK **PostToolUse** hook on `Write|Edit|MultiEdit`. When the tool's `file_path` is a `.md` file directly inside the plans directory (matched under both its path and its realpath, e.g. `/var/folders` vs `/private/var/folders` on macOS), the hook reads the file and calls `onPlan(content, filename)`. `plansDirectoryPath(cwd, env)` gives that directory: `<cwd>/.git/cc-planner-plans` when the workspace has a `.git` directory, otherwise `$CLAUDE_CONFIG_DIR/plans` or `~/.claude/plans`.
+Capture needs no filesystem watching and no fs interception inside the claude process: `planCaptureHooks(plansDir, onPlan)` returns an in-process SDK **PostToolUse** hook on `Write|Edit|MultiEdit`. When the tool's `file_path` is a `.md` file directly inside the plans directory (compared by realpath, so `/var/folders` and `/private/var/folders` on macOS match), the hook reads the file and calls `onPlan(content, filename)`. `plansDirectoryPath(cwd, env)` gives that directory: `<cwd>/.git/cc-planner-plans` when the workspace has a `.git` directory, otherwise `$CLAUDE_CONFIG_DIR/plans` or `~/.claude/plans`.
 
 Plans live on disk — inside the workspace's `.git` directory for git workspaces (for lazy sessions that's a throwaway temp clone). Workspaces without a `.git` directory get live plan updates too, from the default plans directory. As a fallback, the final plan also arrives in `ExitPlanMode`'s input, which the web session re-emits as a `plan_update`.
 
@@ -130,12 +130,12 @@ The server binds `127.0.0.1` by default — it runs claude sessions with the hos
 - **Diff viewer** — Edit/Write tool activity and their permission cards render Shiki-highlighted unified diffs with [@pierre/diffs](https://diffs.com), so changes can be reviewed before they're allowed. Write diffs are computed against the current file on disk.
 - **AskUserQuestion in the browser** — question cards (header chips, 2-4 options with descriptions, multi-select, free-text "Other") render inline in the session feed.
 - **Plan mode + review** — the plan panel renders the plan markdown live as Claude writes it (via the plan-capture PostToolUse hook). When Claude calls `ExitPlanMode`, a review bar appears: approve or request changes with feedback. Approving ends the session — the approved plan is the deliverable.
-- **Session stats** — duration (ticking live), token usage by type and per model, turn count, and hydration volume. Cost is always **estimated from public Claude API token pricing** (`web/lib/pricing.ts`) and marked `~`/`(est.)`; the SDK's own cost figure is never displayed.
+- **Session stats** — duration (ticking live), token usage by type and per model, turn count, and bandwidth — files and bytes hydrated out of the repo total, and (for lazy workspaces) what the session downloaded versus a lower bound for a full clone (`web/lib/bandwidth.ts`). Cost is always **estimated from public Claude API token pricing** (`web/lib/pricing.ts`) and marked `~`/`(est.)`; the SDK's own cost figure is never displayed.
 - **localStorage persistence** — prompts, repo metadata, status, stats, and the latest plan of every session persist in the browser (live transcripts are not persisted across reloads).
 - **Settings in the UI** — the sidebar settings (persisted in localStorage, sent with each new session) cover what would otherwise be server env vars, which matters for the desktop app: an Anthropic API key (`ANTHROPIC_API_KEY`), an LLM gateway base URL + bearer token (`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`), and the hydration strategy for lazy sessions (`gh` / `git` / auto). Leave auth empty to use the server's environment — e.g. an existing `claude` login on the desktop.
 - **Local folder workspaces** — the start form's workspace picker accepts an absolute path (`~` ok) to a checkout on the server's machine instead of a GitHub repo: no clone, no hydration, sessions run directly against the folder. On the desktop app the server _is_ the user's machine, making this the natural mode for working on local repos.
 - **PWA** — installable, with a web manifest and an auto-updating service worker (app shell precached, hashed assets cached on demand).
-- **Prompt-free read-only tools** — `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`, and `TodoWrite` never require a permission prompt: they're passed to the CLI as `allowedTools`, with a `canUseTool` short-circuit as fallback. On lazy workspaces Read hydrates on demand and listings come from the manifest (Glob and Grep see only hydrated files — see [Limitations](#limitations)).
+- **Prompt-free read-only tools** — `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`, and `TodoWrite` never require a permission prompt: `canUseTool` allows them outright. (They're deliberately not `allowedTools` entries, which would bypass `canUseTool` — the SDK warns about that shadowing.) On lazy workspaces Read hydrates on demand and listings come from the manifest (Glob and Grep see only hydrated files — see [Limitations](#limitations)).
 - **Per-session tool & prompt configuration** — the start form's _Advanced_ section takes extra always-allowed tools (including `Bash(...)` patterns like `Bash(bun test:*)`), disallowed tools (removed from the session entirely), and extra system-prompt instructions. Custom instructions are appended to the Claude Code preset system prompt (the SDK supports append only — there is no prepend) and compose with the hydration guidance on lazy workspaces.
 - **Bash policy** — a deterministic policy (`web/lib/bash-policy.ts`) with two layers. Read-only commands (including read-only git metadata commands) are auto-allowed on every workspace. On lazy workspaces, commands that fight the VFS — tree walks, bulk file readers, recursive searches, and git commands that would promisor-fetch blobs for every commit or file they touch — are denied with guidance (subprocesses only see already-hydrated files; Read hydrates on demand). Anything not provably safe falls through to a normal permission prompt, and git `-c` / `--config-env` / `--exec-path` always prompt. Enforced by a PreToolUse hook (so it catches commands plan mode would auto-allow) plus matching guidance appended to the system prompt, which in practice steers Claude to LS/Read before any command is attempted.
 
@@ -297,14 +297,14 @@ Or from the command line:
 bun run scripts/plan-remote-repo.ts owner/repo "Create a plan for adding rate limiting"
 ```
 
-### How It Works
+### How Hydration Works
 
 The blob-less clone is an internal implementation detail — you never interact with it directly:
 
 1. `planRemoteRepo()` clones the repo into a temp directory with `git clone --filter=blob:none --no-checkout`. This downloads commits and trees but **zero file contents**, and leaves the working tree empty. For a large repo this is a few hundred KB instead of hundreds of MB.
 2. The child claude process is started with `preload/vfs-hydrate.ts` in `BUN_OPTIONS`; the preload builds a manifest of every file in the tree from `git ls-tree` (purely local — trees are always present in a blob-less clone).
 3. Directory listings (`readdir`), existence checks (`existsSync`), and path stats are answered from the manifest with **no network access**, so Claude sees the full repo structure immediately. Paths are matched under both the root and its real path (on macOS the temp dir `/var/folders/...` is realpathed to `/private/var/folders/...`).
-4. The first time Claude actually reads a file (`readFileSync`, `fs.promises.readFile`, `open`, ...), the preload fetches it with `gh api repos/<owner>/<repo>/contents/<path>?ref=<sha>` (raw media type), writes it to disk, and the read proceeds normally.
+4. The first time Claude actually reads a file (`readFileSync`, `fs.promises.readFile`, `open`, ...), the preload fetches it — with the `gh` strategy via `gh api repos/<owner>/<repo>/contents/<path>?ref=<sha>` (raw media type), see [Hydration Strategies](#hydration-strategies) — writes it to disk, and the read proceeds normally.
 5. Hydrated files live on disk, so subsequent access — including from subprocesses like `rg` or `cat` spawned by Bash tools — works without interception. Files Claude writes or deletes behave like a normal filesystem.
 
 Authentication for private repos is delegated entirely to the `gh` CLI (`gh auth login`), both for the initial clone (via `gh auth git-credential`) and for content fetches (via `gh api`).
@@ -332,7 +332,7 @@ Two fetch strategies are supported; `planRemoteRepo()` picks automatically:
 - Claude Code's Glob and Grep tools shell out to ripgrep, which runs outside the preload and only sees files that have already been hydrated. Explore directory structure with LS/Read and `git ls-files` / `git ls-tree` instead.
 - Other content searches that spawn subprocesses (grep, rg from Bash) likewise only see hydrated files. Plan-mode exploration driven by LS/Read works fully.
 - Symlinks and submodules in the tree are not hydrated.
-- Hydration is synchronous (blocking `gh` call) per first read of each file.
+- Synchronous reads (`readFileSync`, ...) block on the fetch for each file's first read; async reads (`fs.promises.readFile`, ...) hydrate without blocking, and concurrent reads of the same file share one fetch.
 
 ## Running Inside a Claude Code Sandbox
 
@@ -345,17 +345,10 @@ When you use the SDK inside a Claude Code remote session (e.g., `claude.ai/code`
 Before spawning a child claude process, you need to:
 
 1. Set `ANTHROPIC_AUTH_TOKEN` to the contents of `~/.claude/remote/.session_ingress_token`
-2. Delete env vars that reference parent-only file descriptors:
-   - `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`
-   - `CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR`
-3. Delete env vars that conflict with the parent session:
-   - `CLAUDE_CODE_SESSION_ID`
-   - `CLAUDE_CODE_REMOTE_SESSION_ID`
-   - `CLAUDE_CODE_CONTAINER_ID`
-   - `CLAUDECODE`
-   - `CLAUDE_CODE_REMOTE`
+2. Delete `CLAUDECODE` and every parent-harness `CLAUDE_CODE_*` var — FD pointers (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, ...), session ids, and transport flags such as `CLAUDE_CODE_INCLUDE_PARTIAL_MESSAGES`, which makes a child `claude -p` exit immediately. User-configurable ones (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, ...) are kept.
+3. Delete parent-session `CLAUDE_*` vars outside that namespace (`CLAUDE_PID`, `CLAUDE_EFFORT`, ...).
 
-The example at `scripts/sdk-example.ts` demonstrates this with a `buildChildEnv()` helper (`scripts/lib/child-env.ts`) that conditionally applies these fixups only when running inside a sandbox, so the same code works on both a regular desktop and inside `claude.ai/code`:
+The example at `scripts/sdk-example.ts` demonstrates this with a `buildChildEnv()` helper (`scripts/lib/child-env.ts`) that applies these fixups only when running inside a sandbox (`CLAUDE_CODE_REMOTE=true`; elsewhere it just unsets `CLAUDECODE`), so the same code works on both a regular desktop and inside `claude.ai/code`:
 
 ```bash
 bun run scripts/sdk-example.ts
@@ -405,7 +398,7 @@ Sent when a file is hydrated from GitHub on first read.
 
 ### `hydrate_error`
 
-Sent when a `gh api` fetch fails (the read then throws `EIO`).
+Sent when a fetch fails — `gh api` or `git cat-file`, per the strategy (the read then throws `EIO`).
 
 ```typescript
 {
@@ -431,7 +424,7 @@ cc-planner/
 ├── desktop/
 │   └── index.ts                # macOS app entry: embeds the server, opens a window
 ├── preload/
-│   ├── vfs-hydrate.ts          # On-demand hydration over blob-less clones
+│   └── vfs-hydrate.ts          # On-demand hydration over blob-less clones
 ├── scripts/
 │   ├── claude-vfs.ts           # Plain Claude Code CLI on a lazily-hydrated workspace
 │   ├── bash-policy-hook.ts     # PreToolUse Bash hook for the launcher (bash policy)
@@ -461,11 +454,14 @@ cc-planner/
     │   ├── protocol.ts         # Browser <-> server message types
     │   ├── validate.ts         # Validation of untrusted browser messages
     │   ├── bash-policy.ts      # Bash command policy + hydration guidance
+    │   ├── bash-policy/        # Policy engine: shell lexer, per-command args, git, sed/awk
+    │   ├── bandwidth.ts        # Bandwidth used vs a full clone (stats panel)
     │   ├── pricing.ts          # Public token pricing for cost estimates
     │   └── session.ts          # ClaudeSession: SDK <-> browser bridge
     ├── session.test.ts         # Bun test suite (session bridge, offline)
     ├── validate.test.ts        # Bun test suite (message validation, server)
     ├── bash-policy.test.ts     # Bun test suite (Bash policy)
+    ├── bandwidth.test.ts       # Bun test suite (bandwidth summary)
     ├── public/                 # Static assets (PWA icons)
     └── src/                    # TypeScript Web Components (Vite)
         ├── main.ts             # Entry: styles, components, SW registration
@@ -481,15 +477,19 @@ cc-planner/
 
 ### Plan capture
 
-`planCaptureHooks()` reports only writes of `.md` files directly inside the plans directory, comparing against both spellings of the directory (path and realpath):
+`planCaptureHooks()` reports only writes of `.md` files directly inside the plans directory. Paths are compared by realpath when the hook fires — by then the plans directory exists (the first plan write creates it), and Claude Code may report the realpath'd spelling (macOS: `/var/folders` → `/private/var/folders`):
 
 ```typescript
 const hook: HookCallback = async (input) => {
   if (input.hook_event_name !== "PostToolUse") return {};
   const filePath = (input.tool_input as { file_path?: unknown } | undefined)?.file_path;
   if (typeof filePath !== "string" || !filePath.endsWith(".md")) return {};
-  if (!dirs.includes(path.dirname(path.resolve(filePath)))) return {};
-  onPlan(readFileSync(filePath, "utf-8"), path.basename(filePath));
+  if (realOrResolved(path.dirname(filePath)) !== realOrResolved(plansDir)) return {};
+  try {
+    onPlan(readFileSync(filePath, "utf-8"), path.basename(filePath));
+  } catch {
+    // Unreadable right after the write — ExitPlanMode still carries the plan.
+  }
   return {};
 };
 return [{ matcher: "Write|Edit|MultiEdit", hooks: [hook] }];
