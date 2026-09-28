@@ -1,4 +1,5 @@
 import type { ElectrobunConfig } from "electrobun";
+import { nativePackageName } from "./scripts/lib/runtime-paths";
 
 export default {
   app: {
@@ -20,10 +21,12 @@ export default {
     copy: {
       "web/dist": "web-dist",
       preload: "preload",
-      "node_modules/@anthropic-ai/claude-agent-sdk": "claude-agent-sdk",
+      // The native claude binary for the build machine's platform (the SDK
+      // itself is bundled into the bun entrypoint).
+      [`node_modules/${nativePackageName()}`]: "claude-native",
     },
-    // The preload scripts and claude-agent-sdk/cli.js are spawned as real
-    // files by child processes — they can't live inside an asar archive.
+    // The preload scripts and the claude binary are loaded as real files by
+    // child processes — they can't live inside an asar archive.
     useAsar: false,
     // Local app bundle only; flip on (with codesign/notarize) to distribute.
     mac: {

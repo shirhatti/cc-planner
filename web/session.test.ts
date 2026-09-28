@@ -14,6 +14,7 @@ import {
   expandHome,
   gatewayEnv,
   ClaudeSession,
+  isPlanFile,
   makeRunner,
   resolveRepoMode,
   summarizeToolInput,
@@ -33,8 +34,12 @@ const QUESTIONS = [
   },
 ];
 
-function toolOptions(toolUseID: string): { toolUseID: string; signal: AbortSignal } {
-  return { toolUseID, signal: new AbortController().signal };
+function toolOptions(toolUseID: string): {
+  toolUseID: string;
+  requestId: string;
+  signal: AbortSignal;
+} {
+  return { toolUseID, requestId: `req_${toolUseID}`, signal: new AbortController().signal };
 }
 
 /** Builds a runner whose "session" just runs `body` and yields its messages. */
@@ -145,6 +150,17 @@ describe("pricing", () => {
   test("matches date-suffixed model IDs by longest prefix", () => {
     // claude-opus-4-8 must not fall through to the claude-opus-4 (4.0) rates
     expect(priceForModel("claude-opus-4-8")?.inputPerMTok).toBe(5);
+    // Claude 5 models, longest prefix first (opus-5-5 is not opus-5).
+    expect(priceForModel("claude-opus-5-5")).toMatchObject({
+      inputPerMTok: 4,
+      outputPerMTok: 20,
+      cacheReadPerMTok: 0.2,
+      cacheWritePerMTok: 5,
+    });
+    expect(priceForModel("claude-opus-5")?.inputPerMTok).toBe(5);
+    expect(priceForModel("claude-sonnet-5")?.outputPerMTok).toBe(10);
+    expect(priceForModel("claude-fable-5-1")?.cacheReadPerMTok).toBe(0.25);
+    expect(priceForModel("claude-fable-5")?.cacheReadPerMTok).toBe(1);
     expect(priceForModel("claude-opus-4-20250514")?.inputPerMTok).toBe(15);
     expect(priceForModel("claude-sonnet-4-5-20250929")?.outputPerMTok).toBe(15);
     expect(priceForModel("claude-haiku-4-5-20251001")?.cacheReadPerMTok).toBeCloseTo(0.1);
@@ -171,9 +187,21 @@ describe("pricing", () => {
   });
 });
 
+describe("isPlanFile", () => {
+  test("recognizes the workspace and default plans dirs only", () => {
+    expect(isPlanFile("/private/var/folders/x/T/cc-planner-a/.git/cc-planner-plans/p.md")).toBe(
+      true,
+    );
+    expect(isPlanFile("/Users/me/.claude/plans/p.md")).toBe(true);
+    expect(isPlanFile("/tmp/ws/src/index.ts")).toBe(false);
+    expect(isPlanFile("/tmp/ws/.git/cc-planner-plans/nested/p.md")).toBe(false);
+    expect(isPlanFile(undefined)).toBe(false);
+  });
+});
+
 describe("ClaudeSession", () => {
   test("AskUserQuestion round-trips answers from the browser", async () => {
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     const sent: SessionEvent[] = [];
     const runner = fakeRunner(async function* (args) {
       results.push(
@@ -208,7 +236,7 @@ describe("ClaudeSession", () => {
   });
 
   test("plan approval allows ExitPlanMode and interrupts the session", async () => {
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     const sent: SessionEvent[] = [];
     let interrupted = false;
 
@@ -246,7 +274,7 @@ describe("ClaudeSession", () => {
   });
 
   test("plan rejection denies ExitPlanMode with the user's feedback", async () => {
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     const runner = fakeRunner(async function* (args) {
       results.push(await args.canUseTool("ExitPlanMode", {}, toolOptions("tu_3")));
       yield* [] as SDKMessage[];
@@ -310,47 +338,8 @@ describe("ClaudeSession", () => {
     });
   });
 
-  test("plan approval without stopOnPlanApproval lets the session continue", async () => {
-    const results: PermissionResult[] = [];
-    const sent: SessionEvent[] = [];
-    let interrupted = false;
-
-    const runner: SessionRunner = (args) => {
-      const gen = (async function* () {
-        results.push(
-          await args.canUseTool("ExitPlanMode", { allowedPrompts: [] }, toolOptions("tu_c")),
-        );
-        yield* [] as SDKMessage[];
-      })() as RunnerResult["session"];
-      gen.interrupt = async () => {
-        interrupted = true;
-      };
-      return { session: gen, repo: "owner/repo", ref: "abc123def456" };
-    };
-
-    const session: ClaudeSession = new ClaudeSession((msg) => {
-      sent.push(msg);
-      if (msg.type === "plan_review") {
-        session.handleClientMessage({
-          type: "plan_decision",
-          sessionId: "s1",
-          id: msg.id,
-          approved: true,
-        });
-        session.handleClientMessage({ type: "end_session", sessionId: "s1" });
-      }
-    }, runner);
-
-    await session.start({ prompt: "p", mode: "plan", stopOnPlanApproval: false });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-
-    expect(results[0]?.behavior).toBe("allow");
-    expect(interrupted).toBe(false);
-    expect(sent.some((m) => m.type === "plan_decided" && m.approved)).toBe(true);
-  });
-
   test("gated tools become browser permission requests", async () => {
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     const sent: SessionEvent[] = [];
     const runner = fakeRunner(async function* (args) {
       results.push(await args.canUseTool("Bash", { command: "bun test" }, toolOptions("tu_a")));
@@ -395,7 +384,7 @@ describe("ClaudeSession", () => {
       }
     }, runner);
 
-    await session.start({ prompt: "p", mode: "default" });
+    await session.start({ prompt: "p" });
 
     expect(results[0]).toEqual({
       behavior: "allow",
@@ -419,7 +408,7 @@ describe("ClaudeSession", () => {
 
   test("hydrating workspaces enforce the Bash policy and append guidance", async () => {
     const sent: SessionEvent[] = [];
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     let appendedPrompt: string | undefined;
 
     const runner: SessionRunner = (args) => {
@@ -460,14 +449,14 @@ describe("ClaudeSession", () => {
     await session.start({ prompt: "p" });
 
     expect(appendedPrompt).toContain("blob-less git clone");
-    expect(results[0].behavior).toBe("deny");
+    expect(results[0]?.behavior).toBe("deny");
     expect(results[0]).toMatchObject({ behavior: "deny" });
     expect(sent.some((m) => m.type === "notice" && m.text.includes("find"))).toBe(true);
     expect(results[1]).toEqual({
       behavior: "allow",
       updatedInput: { command: "git log --oneline" },
     });
-    expect(results[2].behavior).toBe("allow");
+    expect(results[2]?.behavior).toBe("allow");
     // Only the "ask" command produced a permission card.
     expect(sent.filter((m) => m.type === "permission_request")).toHaveLength(1);
   });
@@ -533,7 +522,7 @@ describe("ClaudeSession", () => {
     const runner: SessionRunner = (args) => {
       const gen = (async function* () {
         const matchers = args.hooks?.PreToolUse ?? [];
-        const taskHook = matchers.find((m) => m.matcher === "Task")?.hooks[0];
+        const taskHook = matchers.find((m) => m.matcher === "Task|Agent")?.hooks[0];
         expect(taskHook).toBeDefined();
         const signal = new AbortController().signal;
         hookOutputs.push(
@@ -569,7 +558,7 @@ describe("ClaudeSession", () => {
 
   test("baked workspaces auto-allow read-only Bash with no card or denial", async () => {
     const sent: SessionEvent[] = [];
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     const runner = fakeRunner(async function* (args) {
       // The hook is installed on every workspace and auto-allows read-only
       // commands the CLI doesn't recognize (the reported git ls-tree case).
@@ -611,15 +600,74 @@ describe("ClaudeSession", () => {
       }
     }, runner);
     await session.start({ prompt: "p" });
-    expect(results[0].behavior).toBe("allow");
-    expect(results[1].behavior).toBe("allow");
+    expect(results[0]?.behavior).toBe("allow");
+    expect(results[1]?.behavior).toBe("allow");
     expect(sent.filter((m) => m.type === "permission_request")).toHaveLength(1);
     expect(sent.some((m) => m.type === "notice")).toBe(false);
   });
 
+  test("plan-only: Stop is blocked until ExitPlanMode was called, once per attempt", async () => {
+    const outputs: unknown[] = [];
+    let runnerArgs: Parameters<SessionRunner>[0] | undefined;
+    const runner = fakeRunner(async function* (args) {
+      runnerArgs = args;
+      const stop = args.hooks?.Stop?.[0]?.hooks[0];
+      const fire = (active: boolean) =>
+        stop!({ hook_event_name: "Stop", stop_hook_active: active } as never, undefined, {
+          signal: new AbortController().signal,
+        });
+      // Answered without planning → sent back to write the plan...
+      outputs.push(await fire(false));
+      // ...but the retry itself is never blocked (no loops).
+      outputs.push(await fire(true));
+      // A rejected plan must be resubmitted before stopping.
+      await args.canUseTool("ExitPlanMode", { plan: "# P" }, toolOptions("tu_x"));
+      outputs.push(await fire(false));
+      yield* [] as SDKMessage[];
+    });
+
+    const session: ClaudeSession = new ClaudeSession((msg) => {
+      if (msg.type === "plan_review") {
+        session.handleClientMessage({
+          type: "plan_decision",
+          sessionId: "s1",
+          id: msg.id,
+          approved: false,
+          feedback: "more detail",
+        });
+      }
+    }, runner);
+    await session.start({ prompt: "p" });
+
+    expect(runnerArgs?.planModeInstructions).toContain(
+      "Never end your turn without calling ExitPlanMode",
+    );
+    expect(outputs[0]).toMatchObject({ decision: "block" });
+    expect(outputs[1]).toEqual({});
+    expect(outputs[2]).toMatchObject({ decision: "block" });
+  });
+
+  test("plan-only: Stop is allowed while a submitted plan awaits review", async () => {
+    let output: unknown;
+    const runner = fakeRunner(async function* (args) {
+      const stop = args.hooks?.Stop?.[0]?.hooks[0];
+      const review = args.canUseTool("ExitPlanMode", { plan: "# P" }, toolOptions("tu_y"));
+      output = await stop!(
+        { hook_event_name: "Stop", stop_hook_active: false } as never,
+        undefined,
+        { signal: new AbortController().signal },
+      );
+      void review.catch(() => {});
+      yield* [] as SDKMessage[];
+    });
+    const session = new ClaudeSession(() => {}, runner);
+    await session.start({ prompt: "p" });
+    expect(output).toEqual({});
+  });
+
   test("read-only VFS tools are always allowed without a prompt", async () => {
     const sent: SessionEvent[] = [];
-    const results: PermissionResult[] = [];
+    const results: (PermissionResult | null)[] = [];
     let runnerArgs: Parameters<SessionRunner>[0] | undefined;
     const runner = fakeRunner(async function* (args) {
       runnerArgs = args;
@@ -630,14 +678,12 @@ describe("ClaudeSession", () => {
     });
 
     const session = new ClaudeSession((msg) => sent.push(msg), runner);
-    await session.start({ prompt: "p", mode: "default" });
+    await session.start({ prompt: "p" });
 
-    // Passed to the CLI as allowedTools (no prompt at all)...
-    expect(runnerArgs?.allowedTools).toEqual(
-      expect.arrayContaining(["Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite"]),
-    );
-    // ...and short-circuited in canUseTool as a fallback.
-    expect(results.every((r) => r.behavior === "allow")).toBe(true);
+    // Allowed by canUseTool, not by bare allowedTools entries (which would
+    // shadow the callback — the SDK warns CLAUDE_SDK_CAN_USE_TOOL_SHADOWED).
+    expect(runnerArgs?.allowedTools).toBeUndefined();
+    expect(results.every((r) => r?.behavior === "allow")).toBe(true);
     expect(sent.filter((m) => m.type === "permission_request")).toHaveLength(0);
   });
 
@@ -656,9 +702,8 @@ describe("ClaudeSession", () => {
       disallowedTools: ["WebSearch"],
     });
 
-    // User allowlist merges with (and dedupes against) the read-only set.
-    expect(runnerArgs?.allowedTools).toContain("Bash(bun test:*)");
-    expect(runnerArgs?.allowedTools?.filter((t) => t === "Read")).toHaveLength(1);
+    // The user's allowlist passes through as given.
+    expect(runnerArgs?.allowedTools).toEqual(["Bash(bun test:*)", "Read"]);
     expect(runnerArgs?.disallowedTools).toEqual(["WebSearch"]);
     // Hydration guidance and user instructions compose in the append.
     expect(runnerArgs?.appendSystemPrompt).toContain("blob-less git clone");
@@ -801,7 +846,9 @@ describe("ClaudeSession", () => {
       } as unknown as SDKMessage;
     });
 
-    const session = new ClaudeSession((msg) => sent.push(msg), runner);
+    const session = new ClaudeSession((msg) => sent.push(msg), runner, {
+      liveStatsIntervalMs: 0,
+    });
     await session.start({ prompt: "p" });
 
     const statsEvents = sent.filter(
@@ -892,6 +939,61 @@ describe("ClaudeSession", () => {
     });
     // Haiku 4.5: (10*$1 + 10*$5) / 1M
     expect(last?.stats.costUsd).toBeCloseTo(60 / 1e6, 9);
+  });
+
+  test("live stats are throttled trailing-edge and superseded by final stats", async () => {
+    const sent: SessionEvent[] = [];
+    const statsOf = () =>
+      sent.filter(
+        (m): m is Extract<SessionEvent, { type: "session_stats" }> => m.type === "session_stats",
+      );
+    let releaseTurn!: () => void;
+    const turnDone = new Promise<void>((resolve) => (releaseTurn = resolve));
+    const runner = fakeRunner(async function* (args) {
+      // A burst of 50 fetches: the first goes out immediately, the rest
+      // coalesce into a single trailing update with the final counts.
+      for (let i = 0; i < 50; i++) {
+        args.onVfsMessage({ type: "hydrate_fetch", rel: `f${i}.ts`, size: 10 });
+      }
+      await Bun.sleep(250);
+      // Another burst: late-1 goes out immediately (the interval has
+      // elapsed); late-2 waits on the trailing timer, which the turn's
+      // final stats cancel.
+      args.onVfsMessage({ type: "hydrate_fetch", rel: "late-1.ts", size: 10 });
+      args.onVfsMessage({ type: "hydrate_fetch", rel: "late-2.ts", size: 10 });
+      await turnDone;
+      yield {
+        type: "result",
+        subtype: "success",
+        result: "ok",
+        duration_ms: 1,
+        duration_api_ms: 1,
+        num_turns: 1,
+        usage: {},
+        modelUsage: {},
+      } as unknown as SDKMessage;
+    });
+    const session = new ClaudeSession((msg) => sent.push(msg), runner, {
+      liveStatsIntervalMs: 100,
+    });
+    const done = session.start({ prompt: "p" });
+
+    await Bun.sleep(50);
+    // Every hydrate_fetch is still forwarded; stats are coalesced.
+    expect(sent.filter((m) => m.type === "hydrate_fetch").length).toBe(50);
+    expect(statsOf().map((m) => m.stats.filesHydrated)).toEqual([1]);
+
+    await Bun.sleep(250);
+    expect(statsOf().map((m) => m.stats.filesHydrated)).toEqual([1, 50, 51]);
+
+    releaseTurn();
+    await done;
+    const stats = statsOf();
+    expect(stats.at(-1)?.stats.final).toBe(true);
+    expect(stats.at(-1)?.stats.filesHydrated).toBe(52);
+    expect(stats.filter((m) => !m.stats.final)).toHaveLength(3);
+    await Bun.sleep(150);
+    expect(statsOf()).toHaveLength(stats.length);
   });
 
   test("gateway auth is passed to the runner env", async () => {

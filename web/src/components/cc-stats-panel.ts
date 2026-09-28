@@ -1,9 +1,10 @@
 /**
  * <cc-stats-panel> — session statistics: duration (ticking live), token
  * counts by type and per model, estimated cost (public token pricing), and
- * hydration volume.
+ * for lazy workspaces the bandwidth used versus a full clone.
  */
 
+import { bandwidthSummary } from "../../lib/bandwidth";
 import { LIVE_STATUSES, type SessionRecord } from "../store";
 
 export function formatTokens(n: number | null | undefined): string {
@@ -15,6 +16,7 @@ export function formatTokens(n: number | null | undefined): string {
 
 export function formatBytes(n: number): string {
   if (!n) return "0 B";
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)} GB`;
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)} kB`;
   return `${n} B`;
@@ -23,6 +25,36 @@ export function formatBytes(n: number): string {
 export function formatDuration(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
   return s >= 60 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s` : `${s}s`;
+}
+
+function percent(fraction: number): string {
+  const pct = fraction * 100;
+  return pct > 0 && pct < 0.1 ? "<0.1%" : `${pct.toFixed(pct < 10 ? 1 : 0)}%`;
+}
+
+/** Stats cells for a lazy workspace's bandwidth. */
+function bandwidthCells(b: NonNullable<ReturnType<typeof bandwidthSummary>>): [string, string][] {
+  const cells: [string, string][] = [
+    [
+      "Files hydrated",
+      b.totalFiles
+        ? `${b.filesHydrated} of ${b.totalFiles.toLocaleString()} (${percent(b.filesHydrated / b.totalFiles)})`
+        : String(b.filesHydrated),
+    ],
+    [
+      "Content fetched",
+      b.totalBytes != null
+        ? `${formatBytes(b.bytesFetched)} of ${formatBytes(b.totalBytes)}`
+        : formatBytes(b.bytesFetched),
+    ],
+  ];
+  if (b.downloadedBytes != null) cells.push(["Downloaded (total)", formatBytes(b.downloadedBytes)]);
+  if (b.fullCloneBytes != null)
+    cells.push(["Full clone (at least)", formatBytes(b.fullCloneBytes)]);
+  if (b.savedBytes != null && b.savedFraction != null) {
+    cells.push(["Saved (at least)", `${formatBytes(b.savedBytes)} (${percent(b.savedFraction)})`]);
+  }
+  return cells;
 }
 
 export class CcStatsPanel extends HTMLElement {
@@ -80,11 +112,16 @@ export class CcStatsPanel extends HTMLElement {
     const durationMs = live && record.startedAt ? Date.now() - record.startedAt : stats.durationMs;
 
     const cost = (value: number): string => `${stats.estimated ? "~" : ""}$${value.toFixed(4)}`;
-    const summary = [
-      formatDuration(durationMs),
-      `${formatTokens(stats.totals.inputTokens + stats.totals.outputTokens)} tokens`,
-    ];
+    // All tokens processed, cached ones included — uncached input alone is
+    // tiny once the prompt cache is warm.
+    const t = stats.totals;
+    const allTokens = t.inputTokens + t.outputTokens + t.cacheReadTokens + t.cacheCreationTokens;
+    const bandwidth = bandwidthSummary(stats);
+    const summary = [formatDuration(durationMs), `${formatTokens(allTokens)} tokens`];
     if (stats.costUsd != null) summary.push(cost(stats.costUsd));
+    if (bandwidth?.downloadedBytes != null) {
+      summary.push(`${formatBytes(bandwidth.downloadedBytes)} downloaded`);
+    }
     if (!stats.final) summary.push("live");
     this.querySelector(".stats-summary")!.textContent = summary.join(" · ");
 
@@ -103,12 +140,13 @@ export class CcStatsPanel extends HTMLElement {
       ["Output", formatTokens(stats.totals.outputTokens)],
       ["Cache read", formatTokens(stats.totals.cacheReadTokens)],
       ["Cache write", formatTokens(stats.totals.cacheCreationTokens)],
-      ...(stats.filesHydrated
-        ? ([["Files hydrated", `${stats.filesHydrated} (${formatBytes(stats.bytesFetched)})`]] as [
-            string,
-            string,
-          ][])
-        : []),
+      ...(bandwidth
+        ? bandwidthCells(bandwidth)
+        : stats.filesHydrated
+          ? ([
+              ["Files hydrated", `${stats.filesHydrated} (${formatBytes(stats.bytesFetched)})`],
+            ] as [string, string][])
+          : []),
     ];
 
     const grid = this.querySelector(".stats-grid")!;

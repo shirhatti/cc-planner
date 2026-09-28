@@ -54,10 +54,7 @@ for await (const msg of session) {
     case "assistant":
       console.log(
         `[sdk] assistant:`,
-        msg.message.content
-          .filter((b): b is { type: "text"; text: string } => b.type === "text")
-          .map((b) => b.text)
-          .join(""),
+        msg.message.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join(""),
       );
       break;
     case "result":

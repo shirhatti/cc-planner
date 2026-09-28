@@ -698,18 +698,6 @@ select {
   width: 100%;
 }
 
-.stop-on-approval {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.stop-on-approval input {
-  width: auto;
-}
-
 .status-dot.idle {
   background: var(--good);
   opacity: 0.6;

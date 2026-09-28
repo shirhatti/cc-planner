@@ -46,7 +46,6 @@ export interface SessionRecord {
   repo: string;
   branch: string;
   mode: SessionMode;
-  stopOnPlanApproval: boolean;
   plan: string;
   planFilename: string;
   createdAt: number;
@@ -61,6 +60,9 @@ export interface SessionRecord {
 const SESSIONS_KEY = "claude-web-tty.sessions.v1";
 const SETTINGS_KEY = "claude-web-tty.settings.v1";
 
+/** Most sessions kept in localStorage; older ones are pruned on save. */
+export const MAX_STORED_SESSIONS = 100;
+
 function read<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
@@ -70,12 +72,31 @@ function read<T>(key: string, fallback: T): T {
   }
 }
 
-function write(key: string, value: unknown): void {
+/** @returns whether the write succeeded */
+function write(key: string, value: unknown): boolean {
   try {
     localStorage.setItem(key, JSON.stringify(value));
+    return true;
   } catch {
     // Quota exceeded or storage disabled — persistence is best-effort.
+    return false;
   }
+}
+
+/** Newest-first, capped at `limit`. */
+function newest(sessions: SessionRecord[], limit: number): SessionRecord[] {
+  return [...sessions].sort((a, b) => b.createdAt - a.createdAt).slice(0, limit);
+}
+
+/**
+ * Persist the session list, keeping the newest MAX_STORED_SESSIONS. If the
+ * write fails (quota), drop the oldest half and retry once — the record
+ * being saved is recent, so it survives the prune.
+ */
+function writeSessions(sessions: SessionRecord[]): void {
+  const kept = newest(sessions, MAX_STORED_SESSIONS);
+  if (write(SESSIONS_KEY, kept)) return;
+  write(SESSIONS_KEY, newest(kept, Math.max(1, Math.floor(kept.length / 2))));
 }
 
 export function newId(): string {
@@ -99,7 +120,7 @@ export function saveSession(record: SessionRecord): void {
   const idx = sessions.findIndex((s) => s.id === record.id);
   if (idx >= 0) sessions[idx] = record;
   else sessions.push(record);
-  write(SESSIONS_KEY, sessions);
+  writeSessions(sessions);
 }
 
 export function deleteSession(id: string): void {

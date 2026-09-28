@@ -42,9 +42,12 @@ RUN if [ -n "$BAKE_REPO" ]; then \
   && git -C /repo remote set-url origin "https://github.com/$BAKE_REPO.git"; \
   fi
 
-# web/server.ts switches to baked mode iff CC_BAKED_REPO_PATH exists
+# web/server.ts switches to baked mode iff CC_BAKED_REPO_PATH exists.
+# CC_WEB_HOST: the server binds loopback by default; inside the container it
+# must listen on all interfaces for `-p 3000:3000` to reach it.
 ENV CC_BAKED_REPO=$BAKE_REPO \
   CC_BAKED_REPO_PATH=/repo \
+  CC_WEB_HOST=0.0.0.0 \
   PORT=3000
 
 EXPOSE 3000

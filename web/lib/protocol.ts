@@ -7,8 +7,11 @@
  * client-generated `sessionId`.
  */
 
-/** Permission modes the browser can start a session in. */
-export type SessionMode = "plan" | "default" | "acceptEdits";
+/**
+ * Sessions always run in plan mode and end when the plan is approved — the
+ * approved plan is the deliverable.
+ */
+export type SessionMode = "plan";
 
 /** A single question from Claude Code's AskUserQuestion tool. */
 export interface UserQuestion {
@@ -51,6 +54,20 @@ export interface TokenUsage {
  * each assistant turn, then with `final: true` after each completed turn,
  * built from the SDK's authoritative token counts.
  */
+/**
+ * What a lazy workspace downloaded versus what a full clone would need.
+ * Fields are absent when unknown (e.g. a private repo without gh, or a tree
+ * too large for GitHub's trees API).
+ */
+export interface WorkspaceStats {
+  /** Files in the repo at the planned commit (from the manifest). */
+  totalFiles?: number;
+  /** Total size of those files — a full checkout's working tree. */
+  totalBytes?: number;
+  /** Bytes the blob-less clone downloaded (commits and trees). */
+  cloneBytes?: number;
+}
+
 export interface SessionStats {
   durationMs: number;
   /** Time spent waiting on the API (final stats only). */
@@ -72,6 +89,8 @@ export interface SessionStats {
   filesHydrated: number;
   /** Bytes of repo content fetched during hydration (lazy mode only). */
   bytesFetched: number;
+  /** Bandwidth context for lazy workspaces (absent for full checkouts). */
+  workspace?: WorkspaceStats;
   final: boolean;
 }
 
@@ -97,15 +116,8 @@ export type ClientMessage =
       localPath?: string;
       /** Lazy mode: override how file contents are hydrated. */
       strategy?: HydrateStrategy;
-      /** Permission mode. Defaults to "plan". */
+      /** Permission mode — always "plan". */
       mode?: SessionMode;
-      /**
-       * Plan mode only: end the session once the plan is approved (the
-       * classic planner workflow). When false, approval lets Claude continue
-       * into implementation, with tool permissions prompted in the browser.
-       * Defaults to true in plan mode.
-       */
-      stopOnPlanApproval?: boolean;
       /**
        * Extra instructions appended to the Claude Code system prompt (the SDK
        * supports append-to-preset only; there is no prepend).
@@ -173,7 +185,7 @@ export type SessionEvent =
    * Claude called ExitPlanMode — approve or request changes. `plan` is the
    * plan content the CLI injected into the tool input from the plan file;
    * the server also re-emits it as a plan_update so the panel is always
-   * current, even if no plan_file_write event was streamed.
+   * current, even if the plan-capture hook reported nothing.
    */
   | {
       type: "plan_review";

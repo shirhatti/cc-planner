@@ -10,9 +10,8 @@
  * - canUseTool routes every gated tool call to the browser: AskUserQuestion
  *   renders as question cards, ExitPlanMode as a plan review, and everything
  *   else (Bash, Edit, Write, ...) as allow/deny permission cards.
- * - In the classic planner workflow (stopOnPlanApproval), approving the plan
- *   ends the session — the plan is the deliverable. Otherwise approval lets
- *   Claude continue into implementation under browser-prompted permissions.
+ * - Sessions always run in plan mode, and approving the plan ends the
+ *   session — the approved plan is the deliverable.
  */
 
 import { existsSync, readFileSync } from "fs";
@@ -30,6 +29,8 @@ import type {
 import { planBakedRepo, resolveBakedRef } from "../../scripts/lib/plan-baked";
 import { planRemoteRepo } from "../../scripts/lib/plan-remote";
 import type { VfsMessage } from "../../scripts/lib/spawn-vfs";
+import { PLANS_SUBDIR } from "../../scripts/lib/plan-capture";
+import { PLAN_WORKFLOW_INSTRUCTIONS, stopDecision } from "../../scripts/lib/plan-workflow";
 import { evaluateBashCommand, HYDRATION_GUIDANCE } from "./bash-policy";
 import { estimateModelCostUsd } from "./pricing";
 import type {
@@ -42,6 +43,7 @@ import type {
   SessionStats,
   TokenUsage,
   UserQuestion,
+  WorkspaceStats,
 } from "./protocol";
 
 // ---------------------------------------------------------------------------
@@ -126,6 +128,7 @@ export interface RunnerArgs {
   prompt: string | AsyncIterable<SDKUserMessage>;
   permissionMode?: PermissionMode;
   appendSystemPrompt?: string;
+  planModeInstructions?: string;
   hooks?: Partial<Record<HookEvent, HookCallbackMatcher[]>>;
   allowedTools?: string[];
   disallowedTools?: string[];
@@ -143,9 +146,14 @@ export interface RunnerArgs {
 }
 
 export interface RunnerResult {
-  session: AsyncIterable<SDKMessage> & { interrupt?: () => Promise<void> };
+  session: AsyncIterable<SDKMessage> & { interrupt?: () => Promise<unknown> };
   repo: string;
   ref: string;
+  /** Lazy workspaces: bandwidth context for stats. */
+  workspace?: {
+    cloneBytes?: number;
+    checkout: Promise<{ files: number; bytes: number } | undefined>;
+  };
 }
 
 export type SessionRunner = (args: RunnerArgs) => RunnerResult;
@@ -178,8 +186,8 @@ export function makeRunner(defaultMode: RepoMode): SessionRunner {
     if (!repo) {
       throw new Error('A repository ("owner/repo") or a local folder is required');
     }
-    const { session, ref } = planRemoteRepo({ ...args, repo });
-    return { session, repo, ref };
+    const { session, ref, workspace } = planRemoteRepo({ ...args, repo });
+    return { session, repo, ref, workspace };
   };
 }
 
@@ -213,6 +221,15 @@ export function summarizeToolInput(input: Record<string, unknown>): string {
     }
   }
   return "";
+}
+
+/** A path inside a plans directory (the workspace's or the default one). */
+export function isPlanFile(filePath: unknown): boolean {
+  if (typeof filePath !== "string") return false;
+  const dir = path.dirname(filePath).split(path.sep).join("/");
+  return (
+    dir.endsWith(`/${PLANS_SUBDIR.split(path.sep).join("/")}`) || dir.endsWith("/.claude/plans")
+  );
 }
 
 /** Largest file content (bytes) included in a diff payload. */
@@ -298,7 +315,6 @@ export interface StartRequest {
   localPath?: string;
   strategy?: HydrateStrategy;
   mode?: SessionMode;
-  stopOnPlanApproval?: boolean;
   appendSystemPrompt?: string;
   allowedTools?: string[];
   disallowedTools?: string[];
@@ -308,8 +324,9 @@ export interface StartRequest {
 /**
  * Tools answered entirely by the VFS layer (manifest-backed listings and
  * on-demand reads) plus side-effect-free bookkeeping. These never require a
- * permission prompt, in any permission mode: they are passed to the CLI as
- * allowedTools and short-circuited in canUseTool as a fallback.
+ * permission prompt: canUseTool allows them outright. (They are deliberately
+ * not bare allowedTools entries, which would bypass canUseTool entirely —
+ * the SDK warns about that shadowing.)
  */
 export const READ_ONLY_TOOLS = ["Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite"];
 
@@ -319,7 +336,15 @@ export interface ClaudeSessionOptions {
    * command policy and append the hydration guidance to the system prompt.
    */
   hydratingWorkspace?: boolean;
+  /**
+   * Minimum interval between live (non-final) session_stats events. Bursts
+   * of hydrate fetches / assistant messages are coalesced trailing-edge, so
+   * the latest numbers always go out. Default 250ms; 0 disables throttling.
+   */
+  liveStatsIntervalMs?: number;
 }
+
+const DEFAULT_LIVE_STATS_INTERVAL_MS = 250;
 
 export class ClaudeSession {
   private readonly pending = new Map<string, PendingRequest>();
@@ -328,7 +353,10 @@ export class ClaudeSession {
   private session?: RunnerResult["session"];
   private started = false;
   private planApproved = false;
-  private stopOnPlanApproval = true;
+  /** ExitPlanMode was called since the last user message or rejection. */
+  private planSubmitted = false;
+  /** Filename of the last plan file reported, so the review keeps its name. */
+  private planFilename = "plan.md";
   private startedAt = 0;
   /**
    * Usage per API call, keyed by message id. The SDK can emit several
@@ -339,6 +367,10 @@ export class ClaudeSession {
   private readonly liveUsageByMessage = new Map<string, { model: string; usage: TokenUsage }>();
   private filesHydrated = 0;
   private bytesFetched = 0;
+  /** Lazy workspaces only; filled in as the numbers become known. */
+  private workspaceStats?: WorkspaceStats;
+  private lastLiveStatsAt = 0;
+  private liveStatsTimer?: ReturnType<typeof setTimeout>;
 
   constructor(
     private readonly send: (msg: SessionEvent) => void,
@@ -354,8 +386,7 @@ export class ClaudeSession {
     this.started = true;
     this.startedAt = Date.now();
 
-    const mode: SessionMode = req.mode ?? "plan";
-    this.stopOnPlanApproval = mode === "plan" && (req.stopOnPlanApproval ?? true);
+    const mode: SessionMode = "plan";
     this.input.push(req.prompt);
 
     // Compose the system-prompt append: hydration guidance (when the
@@ -366,11 +397,14 @@ export class ClaudeSession {
     ].filter((part): part is string => Boolean(part));
 
     try {
-      const { session, repo, ref } = this.runner({
+      const { session, repo, ref, workspace } = this.runner({
         prompt: this.input,
         permissionMode: mode,
         appendSystemPrompt: appendParts.length ? appendParts.join("\n\n") : undefined,
+        planModeInstructions: PLAN_WORKFLOW_INSTRUCTIONS,
         hooks: {
+          // Send Claude back to plan if it tries to finish without one.
+          Stop: [{ hooks: [this.stopHook] }],
           PreToolUse: [
             // The Bash policy applies everywhere: read-only commands are
             // auto-allowed on every workspace; hydration denials only fire
@@ -378,11 +412,11 @@ export class ClaudeSession {
             // when hydrating.
             { matcher: "Bash", hooks: [this.bashPolicyHook] },
             ...(this.options.hydratingWorkspace
-              ? [{ matcher: "Task", hooks: [this.taskGuidanceHook] }]
+              ? [{ matcher: "Task|Agent", hooks: [this.taskGuidanceHook] }]
               : []),
           ],
         },
-        allowedTools: [...new Set([...READ_ONLY_TOOLS, ...(req.allowedTools ?? [])])],
+        allowedTools: req.allowedTools?.length ? req.allowedTools : undefined,
         disallowedTools: req.disallowedTools?.length ? req.disallowedTools : undefined,
         repo: req.repo,
         branch: req.branch,
@@ -391,17 +425,34 @@ export class ClaudeSession {
         extraEnv: gatewayEnv(req.auth),
         canUseTool: this.canUseTool,
         abortController: this.abort,
-        onPlan: (content, filename) => this.send({ type: "plan_update", filename, content }),
+        onPlan: (content, filename) => {
+          this.planFilename = filename;
+          this.send({ type: "plan_update", filename, content });
+        },
         onVfsMessage: (msg) => this.handleVfsMessage(msg),
       });
       this.session = session;
       this.send({ type: "session_started", repo, ref });
+      if (workspace) {
+        this.workspaceStats = { ...this.workspaceStats, cloneBytes: workspace.cloneBytes };
+        void workspace.checkout.then((checkout) => {
+          if (!checkout) return;
+          this.workspaceStats = {
+            ...this.workspaceStats,
+            totalFiles: this.workspaceStats?.totalFiles ?? checkout.files,
+            totalBytes: checkout.bytes,
+          };
+          this.sendLiveStats();
+        });
+      }
 
       for await (const msg of session) {
         this.handleSdkMessage(msg);
       }
+      this.flushLiveStats();
       this.send({ type: "session_done" });
     } catch (err) {
+      this.flushLiveStats();
       // An abort after plan approval (or disposing the session) is a clean stop.
       if (this.planApproved || this.abort.signal.aborted) {
         this.send({ type: "session_done" });
@@ -409,6 +460,7 @@ export class ClaudeSession {
         this.send({ type: "error", message: err instanceof Error ? err.message : String(err) });
       }
     } finally {
+      this.cancelLiveStats();
       this.input.done();
       this.failPending(new Error("Session ended"));
     }
@@ -417,6 +469,7 @@ export class ClaudeSession {
   handleClientMessage(msg: ClientMessage): void {
     switch (msg.type) {
       case "user_message":
+        this.planSubmitted = false;
         this.input.push(msg.text);
         break;
       case "answer_question":
@@ -442,6 +495,7 @@ export class ClaudeSession {
 
   /** Abort the session entirely and unblock any pending browser round-trips. */
   dispose(): void {
+    this.cancelLiveStats();
     this.failPending(new Error("Session aborted"));
     this.input.done();
     this.abort.abort();
@@ -482,13 +536,26 @@ export class ClaudeSession {
   };
 
   /**
+   * Plan-only sessions end in an approved plan. If Claude tries to finish a
+   * turn without calling ExitPlanMode (e.g. it just answered a question),
+   * block the stop once and send it back to write the plan.
+   */
+  private readonly stopHook: HookCallback = async (input) => {
+    if (input.hook_event_name !== "Stop") return {};
+    return stopDecision(this.planSubmitted || this.planApproved, input.stop_hook_active);
+  };
+
+  /**
    * Subagents (Task tool) get their own prompts and never see the main
    * agent's system-prompt append — without this they rediscover the
    * workspace rules by trial and error (probing the empty worktree, trying
    * find/cat). Inject the hydration guidance into every subagent prompt.
    */
   private readonly taskGuidanceHook: HookCallback = async (input) => {
-    if (input.hook_event_name !== "PreToolUse" || input.tool_name !== "Task") {
+    if (
+      input.hook_event_name !== "PreToolUse" ||
+      (input.tool_name !== "Task" && input.tool_name !== "Agent")
+    ) {
       return {};
     }
     const toolInput = input.tool_input as Record<string, unknown> | undefined;
@@ -515,17 +582,18 @@ export class ClaudeSession {
     }
 
     if (toolName === "ExitPlanMode") {
+      this.planSubmitted = true;
       const allowedPrompts = (input.allowedPrompts ?? []) as { tool: string; prompt: string }[];
       // The CLI injects the plan-file content into the tool input. Re-emit it
       // as a plan_update so the review always has a preview — the plan file
-      // itself may have been written through an API the plan-file VFS doesn't
-      // intercept (e.g. fs.promises), or never written at all.
+      // may live outside the watched plans dir (workspaces without .git), or
+      // never have been written at all.
       const plan = typeof input.plan === "string" ? input.plan : "";
       if (plan.trim()) {
         const filename =
           typeof input.filePath === "string" && input.filePath
             ? path.basename(input.filePath)
-            : "plan.md";
+            : this.planFilename;
         this.send({ type: "plan_update", filename, content: plan });
       }
       const reply = await this.waitForClient(
@@ -536,22 +604,20 @@ export class ClaudeSession {
       const decision = reply.type === "plan_decision" ? reply : undefined;
       const approved = decision?.approved ?? false;
       this.send({ type: "plan_decided", approved });
+      // A rejected plan must be revised and resubmitted before stopping.
+      this.planSubmitted = approved;
 
       if (approved) {
-        if (this.stopOnPlanApproval) {
-          // Planner workflow: the approved plan is the deliverable. Allow the
-          // tool call to resolve, then stop before implementation.
-          this.planApproved = true;
-          setTimeout(() => this.stopSession(), 0);
-        }
+        // The approved plan is the deliverable: allow the tool call to
+        // resolve, then stop before implementation.
+        this.planApproved = true;
+        setTimeout(() => this.stopSession(), 0);
         return { behavior: "allow", updatedInput: input };
       }
       return { behavior: "deny", message: decision?.feedback?.trim() || REJECTION_FALLBACK };
     }
 
-    // Read-only VFS tools never need a prompt; allowedTools already covers
-    // them, but short-circuit here too in case the CLI still asks (e.g. for
-    // a path outside the workspace).
+    // Read-only VFS tools never need a prompt.
     if (READ_ONLY_TOOLS.includes(toolName)) {
       return { behavior: "allow", updatedInput: input };
     }
@@ -650,16 +716,59 @@ export class ClaudeSession {
 
   private handleVfsMessage(msg: VfsMessage): void {
     if (msg.type === "hydrate_init") {
+      this.workspaceStats = { ...this.workspaceStats, totalFiles: Number(msg.files) };
       this.send({ type: "hydrate_init", files: Number(msg.files) });
     } else if (msg.type === "hydrate_fetch") {
       this.filesHydrated += 1;
       this.bytesFetched += Number(msg.size) || 0;
       this.send({ type: "hydrate_fetch", rel: String(msg.rel), size: Number(msg.size) });
+      this.scheduleLiveStats();
+    }
+  }
+
+  /**
+   * Throttled sendLiveStats: sends immediately if the interval has elapsed
+   * since the last live update, otherwise schedules one trailing update
+   * (which computes stats at fire time, so it carries the latest numbers).
+   */
+  private scheduleLiveStats(): void {
+    const interval = this.options.liveStatsIntervalMs ?? DEFAULT_LIVE_STATS_INTERVAL_MS;
+    if (interval <= 0) {
+      this.sendLiveStats();
+      return;
+    }
+    if (this.liveStatsTimer !== undefined) {
+      return; // a trailing update is already pending
+    }
+    const wait = this.lastLiveStatsAt + interval - Date.now();
+    if (wait <= 0) {
+      this.sendLiveStats();
+      return;
+    }
+    this.liveStatsTimer = setTimeout(() => {
+      this.liveStatsTimer = undefined;
+      this.sendLiveStats();
+    }, wait);
+  }
+
+  /** Drop any pending trailing live-stats update. */
+  private cancelLiveStats(): void {
+    if (this.liveStatsTimer !== undefined) {
+      clearTimeout(this.liveStatsTimer);
+      this.liveStatsTimer = undefined;
+    }
+  }
+
+  /** Send a pending trailing live-stats update now, if any. */
+  private flushLiveStats(): void {
+    if (this.liveStatsTimer !== undefined) {
+      this.cancelLiveStats();
       this.sendLiveStats();
     }
   }
 
   private sendLiveStats(): void {
+    this.lastLiveStatsAt = Date.now();
     const usageByModel = new Map<string, TokenUsage>();
     const totals = emptyUsage();
     for (const { model, usage } of this.liveUsageByMessage.values()) {
@@ -688,6 +797,7 @@ export class ClaudeSession {
         byModel,
         filesHydrated: this.filesHydrated,
         bytesFetched: this.bytesFetched,
+        workspace: this.workspaceStats,
         final: false,
       },
     });
@@ -710,7 +820,8 @@ export class ClaudeSession {
               type: "tool_activity",
               name: block.name,
               detail: summarizeToolInput(input),
-              diff: extractDiff(block.name, input),
+              // Plan-file writes render in the plan panel, not as diffs.
+              diff: isPlanFile(input.file_path) ? undefined : extractDiff(block.name, input),
             });
           }
         }
@@ -720,14 +831,16 @@ export class ClaudeSession {
             model: msg.message.model ?? "unknown",
             usage: usageFromRaw(usage),
           });
-          this.sendLiveStats();
+          this.scheduleLiveStats();
         }
         break;
       }
       case "result": {
         // Per-turn stats use the SDK's authoritative (session-cumulative)
         // token counts, but cost is always estimated from public pricing —
-        // the SDK's own cost figure is never shown.
+        // the SDK's own cost figure is never shown. They supersede any
+        // pending live update.
+        this.cancelLiveStats();
         const byModel: SessionStats["byModel"] = {};
         let estimatedTotal: number | undefined;
         for (const [model, usage] of Object.entries(msg.modelUsage ?? {})) {
@@ -755,6 +868,7 @@ export class ClaudeSession {
             byModel,
             filesHydrated: this.filesHydrated,
             bytesFetched: this.bytesFetched,
+            workspace: this.workspaceStats,
             final: true,
           },
         });

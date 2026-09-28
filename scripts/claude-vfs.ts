@@ -1,31 +1,37 @@
 /**
- * Run the plain Claude Code CLI (interactive or -p print mode) on top of the
- * hydrating VFS — no web app, no SDK wrapper. Makes a blob-less clone of the
- * repo, configures the preload, and execs the CLI inside that workspace:
+ * Run the plain Claude Code CLI (interactive or -p print mode) as a planner
+ * on top of the hydrating VFS — no web app, no SDK wrapper. Makes a
+ * blob-less clone of the repo, configures the preload, and runs the CLI in
+ * plan mode inside that workspace:
  *
  *   bun run scripts/claude-vfs.ts <owner/repo> [--branch <b>] [--strategy gh|git] [-- <claude args...>]
  *
  * Examples:
- *   bun run scripts/claude-vfs.ts vercel/next.js -- --permission-mode plan
- *   bun run scripts/claude-vfs.ts owner/repo --branch dev -- -p "Summarize the build system"
+ *   bun run scripts/claude-vfs.ts vercel/next.js
+ *   bun run scripts/claude-vfs.ts owner/repo --branch dev -- -p "Plan a CLI --version flag"
  *
- * Uses your existing claude login/config (~/.claude). The CLI must be the JS
- * entrypoint so --preload applies; this script uses the cli.js vendored in
- * @anthropic-ai/claude-agent-sdk.
+ * Sessions are plan-only: the CLI starts in plan mode, and once a plan is
+ * approved (ExitPlanMode allowed) the session ends and the plan is printed.
+ * Uses your existing claude login/config (~/.claude). The preload rides in
+ * BUN_OPTIONS, which the native (Bun-compiled) claude binary honors.
  */
 
-import { spawnSync } from "child_process";
-import { existsSync, mkdtempSync } from "fs";
+import { spawn } from "child_process";
+import { existsSync, mkdtempSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { bloblessClone, ghAvailable, hydrateEnv } from "./lib/blobless-clone";
 import { buildChildEnv } from "./lib/child-env";
-import { preloadScript } from "./lib/runtime-paths";
+import { PLANS_SUBDIR } from "./lib/plan-capture";
+import { PLAN_WORKFLOW_INSTRUCTIONS } from "./lib/plan-workflow";
+import { claudeExecutablePath, preloadScript } from "./lib/runtime-paths";
+import { preloadEnv } from "./lib/spawn-vfs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-function usage(): never {
+function usage(message?: string): never {
+  if (message) console.error(`[claude-vfs] ${message}`);
   console.error(
     "Usage: bun run scripts/claude-vfs.ts <owner/repo> [--branch <b>] [--strategy gh|git] [-- <claude args...>]",
   );
@@ -48,18 +54,23 @@ for (let i = 0; i < ours.length; i++) {
 }
 if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) usage();
 
-const cliPath = path.join(
-  __dirname,
-  "..",
-  "node_modules",
-  "@anthropic-ai",
-  "claude-agent-sdk",
-  "cli.js",
-);
-if (!existsSync(cliPath)) {
-  console.error(`Claude Code CLI not found at ${cliPath} — run \`bun install\` first.`);
-  process.exit(1);
+// Plan-only: refuse flags that would leave plan mode or replace the
+// settings that enforce it.
+for (let i = 0; i < claudeArgs.length; i++) {
+  const arg = claudeArgs[i];
+  const mode = arg === "--permission-mode" ? claudeArgs[i + 1] : arg.split("--permission-mode=")[1];
+  if (mode !== undefined && mode !== "plan") {
+    usage(`sessions are plan-only; --permission-mode ${mode} is not supported`);
+  }
+  if (arg === "--settings" || arg.startsWith("--settings=")) {
+    usage("--settings is not supported: the launcher supplies its own (hooks, plansDirectory)");
+  }
+  if (arg === "--dangerously-skip-permissions" || arg === "--allow-dangerously-skip-permissions") {
+    usage(`${arg} is not supported: sessions are plan-only`);
+  }
 }
+
+const claudeBin = claudeExecutablePath();
 
 const root = mkdtempSync(path.join(tmpdir(), "cc-planner-"));
 console.error(`[claude-vfs] blob-less cloning ${repo}${branch ? `@${branch}` : ""} ...`);
@@ -69,13 +80,76 @@ console.error(
   `[claude-vfs] workspace ${root} @ ${clone.ref.slice(0, 12)} (hydration: ${resolvedStrategy})`,
 );
 
-const result = spawnSync(
-  process.execPath, // the running bun
-  ["--preload", preloadScript("vfs-hydrate.ts"), cliPath, ...claudeArgs],
+const shellQuote = (part: string): string => `'${part.replace(/'/g, `'\\''`)}'`;
+const hookCommand = (script: string): string =>
+  [process.execPath, path.join(__dirname, script)].map(shellQuote).join(" ");
+
+// - Bash policy (PreToolUse): read-only commands such as git ls-tree run
+//   without a prompt; VFS-hostile ones are denied with guidance.
+// - Plan approval (PostToolUse on ExitPlanMode): ends the session.
+// - Stop (interactive only): sends Claude back to plan if it tries to finish
+//   without one. In -p mode ExitPlanMode doesn't exist (no one can
+//   approve), so the answer itself is the plan.
+// - plansDirectory: plan files stay inside the throwaway clone's .git dir.
+const printMode = claudeArgs.some((a) => a === "-p" || a === "--print");
+const settings = JSON.stringify({
+  plansDirectory: PLANS_SUBDIR,
+  hooks: {
+    PreToolUse: [
+      {
+        matcher: "Bash",
+        hooks: [{ type: "command", command: hookCommand("bash-policy-hook.ts") }],
+      },
+    ],
+    PostToolUse: [
+      {
+        matcher: "ExitPlanMode",
+        hooks: [{ type: "command", command: hookCommand("plan-approved-hook.ts") }],
+      },
+    ],
+    ...(printMode
+      ? {}
+      : { Stop: [{ hooks: [{ type: "command", command: hookCommand("plan-stop-hook.ts") }] }] }),
+  },
+});
+// Keep Claude planning even when a request reads like a question. The CLI
+// only accepts --plan-mode-instructions with --print; interactive sessions
+// get the same text appended to the system prompt.
+const workflowArgs = printMode
+  ? ["--plan-mode-instructions", PLAN_WORKFLOW_INSTRUCTIONS]
+  : ["--append-system-prompt", PLAN_WORKFLOW_INSTRUCTIONS];
+
+const approvedFile = path.join(mkdtempSync(path.join(tmpdir(), "cc-planner-approved-")), "plan.md");
+const baseEnv = { ...buildChildEnv(), ...hydrateEnv(clone, resolvedStrategy) };
+const child = spawn(
+  claudeBin,
+  ["--permission-mode", "plan", "--settings", settings, ...workflowArgs, ...claudeArgs],
   {
     cwd: root,
     stdio: "inherit",
-    env: { ...buildChildEnv(), ...hydrateEnv(clone, resolvedStrategy) },
+    env: {
+      ...baseEnv,
+      ...preloadEnv([preloadScript("vfs-hydrate.ts")], baseEnv),
+      CC_PLANNER_APPROVED_FILE: approvedFile,
+    },
   },
 );
-process.exit(result.status ?? 1);
+
+// The approval hook writes the plan; give the CLI a moment to render, then
+// end the session (interactive mode would otherwise wait for more input).
+let approved = false;
+const poll = setInterval(() => {
+  if (approved || !existsSync(approvedFile)) return;
+  approved = true;
+  setTimeout(() => child.kill("SIGTERM"), 500);
+}, 250);
+
+child.on("exit", (code) => {
+  clearInterval(poll);
+  if (approved) {
+    console.error("\n[claude-vfs] plan approved — session ended.\n");
+    console.log(readFileSync(approvedFile, "utf-8"));
+    process.exit(0);
+  }
+  process.exit(code ?? 1);
+});
