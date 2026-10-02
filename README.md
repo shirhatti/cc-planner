@@ -139,7 +139,7 @@ The server binds `127.0.0.1` by default — it runs claude sessions with the hos
 - **Per-session tool & prompt configuration** — the start form's _Advanced_ section takes extra always-allowed tools (including `Bash(...)` patterns like `Bash(bun test:*)`), disallowed tools (removed from the session entirely), and extra system-prompt instructions. Custom instructions are appended to the Claude Code preset system prompt (the SDK supports append only — there is no prepend) and compose with the hydration guidance on lazy workspaces.
 - **Bash policy** — a deterministic policy (`web/lib/bash-policy.ts`) with two layers. Read-only commands (including read-only git metadata commands) are auto-allowed on every workspace. On lazy workspaces, commands that fight the VFS — tree walks, bulk file readers, recursive searches, and git commands that would promisor-fetch blobs for every commit or file they touch — are denied with guidance (subprocesses only see already-hydrated files; Read hydrates on demand). Anything not provably safe falls through to a normal permission prompt, and git `-c` / `--config-env` / `--exec-path` always prompt. Enforced by a PreToolUse hook (so it catches commands plan mode would auto-allow) plus matching guidance appended to the system prompt, which in practice steers Claude to LS/Read before any command is attempted.
 
-The frontend is TypeScript Web Components built with Vite (`web/src/`), typed against the shared WebSocket protocol (`web/lib/protocol.ts`).
+The frontend is a React app built on [assistant-ui](https://www.assistant-ui.com/) primitives and styled with Tailwind, bundled by Vite (`web/src/`) and typed against the shared WebSocket protocol (`web/lib/protocol.ts`). A session store feeds an assistant-ui external-store runtime: each session's transcript becomes thread messages, AskUserQuestion and permission prompts are tool-call UIs answered through `addResult`, and the session list is a thread list.
 
 ### Repo modes
 
@@ -190,12 +190,12 @@ The app builds unsigned by default; enable `mac.codesign`/`mac.notarize`/`mac.cr
 ### Web architecture
 
 ```
-browser (Vite + TS Web Components)  ←WebSocket→  web/lib/server.ts (Bun.serve, serves web/dist)
+browser (Vite + React + assistant-ui)  ←WebSocket→  web/lib/server.ts (Bun.serve, serves web/dist)
                                                    hosts: web/server.ts (CLI) / desktop/index.ts (macOS app)
-  cc-app / cc-feed / cc-composer                   ClaudeSession (web/lib/session.ts)
-  cc-plan-panel / cc-question-card                   ├─ InputQueue → SDK streaming input (multi-turn)
-  cc-diff (@pierre/diffs) / cc-stats-panel           ├─ canUseTool → question / plan review / permission cards
-  cc-session-list / cc-settings-panel                ├─ planRemoteRepo() — lazy hydration workspace
+  SessionStore → useExternalStoreRuntime           ClaudeSession (web/lib/session.ts)
+  Thread / Composer / SessionList (thread list)      ├─ InputQueue → SDK streaming input (multi-turn)
+  tool UIs: question / permission / diff             ├─ canUseTool → question / plan review / permission cards
+  PlanPanel / StatsPanel / SettingsPanel             ├─ planRemoteRepo() — lazy hydration workspace
                                                      └─ planBakedRepo()  — baked workspace
                                                         (both via runSession(): scripts/lib/run-session.ts)
 ```
@@ -462,15 +462,18 @@ cc-planner/
     ├── validate.test.ts        # Bun test suite (message validation, server)
     ├── bash-policy.test.ts     # Bun test suite (Bash policy)
     ├── bandwidth.test.ts       # Bun test suite (bandwidth summary)
+    ├── feed.test.ts            # Bun test suite (transcript → thread messages)
     ├── public/                 # Static assets (PWA icons)
-    └── src/                    # TypeScript Web Components (Vite)
-        ├── main.ts             # Entry: styles, components, SW registration
+    └── src/                    # React + assistant-ui app (Vite, Tailwind)
+        ├── main.tsx            # Entry: styles, WebSocket connect, SW registration
+        ├── session-store.ts    # WebSocket + session state (useSyncExternalStore)
+        ├── feed.ts             # Transcript items → assistant-ui thread messages
         ├── store.ts            # localStorage persistence
-        ├── markdown.ts         # Minimal safe markdown renderer
-        ├── styles.css
-        └── components/         # cc-app, cc-feed, cc-composer, cc-diff,
-                                # cc-plan-panel, cc-question-card, cc-stats-panel,
-                                # cc-session-list, cc-start-form, cc-settings-panel
+        ├── format.ts           # Stats formatting
+        ├── styles.css          # Tailwind theme
+        └── components/         # App (runtime), Thread, parts (tool/data UIs),
+                                # Diff, SessionList, StartForm, PlanPanel,
+                                # StatsPanel, SettingsPanel
 ```
 
 ## Implementation Details
